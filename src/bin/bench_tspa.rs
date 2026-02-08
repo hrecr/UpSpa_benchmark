@@ -8,27 +8,17 @@ use rand_core::SeedableRng;
 
 use tspa::protocols::tspa;
 
-const WARMUP_ITERS: usize = 300;
-const SAMPLES: usize = 2000;
-
-// 5x5 grid: nsp 20..100 step 20, tsp% 20..100 step 20
-const NSP_START: usize = 20;
-const NSP_END: usize = 100;
-const NSP_STEP: usize = 20;
-
-const PCT_START: usize = 20;
-const PCT_END: usize = 100;
-const PCT_STEP: usize = 20;
-
-fn grid_5x5() -> Vec<(usize, usize)> {
-    let mut v = Vec::with_capacity(25);
-    for nsp in (NSP_START..=NSP_END).step_by(NSP_STEP) {
-        for pct in (PCT_START..=PCT_END).step_by(PCT_STEP) {
-            let tsp_ = ((nsp * pct) / 100).max(1);
-            v.push((nsp, tsp_));
-        }
-    }
-    v
+fn parse_list_usize(s: &str) -> Vec<usize> {
+    s.split(',')
+        .filter(|x| !x.trim().is_empty())
+        .map(|x| x.trim().parse().unwrap())
+        .collect()
+}
+fn parse_list_u32(s: &str) -> Vec<u32> {
+    s.split(',')
+        .filter(|x| !x.trim().is_empty())
+        .map(|x| x.trim().parse().unwrap())
+        .collect()
 }
 
 fn seed_for(tag: &[u8], nsp: usize, tsp_: usize) -> [u8; 32] {
@@ -75,7 +65,15 @@ fn compute_stats(mut xs: Vec<u128>) -> Stats {
         0.0
     };
 
-    Stats { n, min_ns, p50_ns, p95_ns, max_ns, mean_ns, stddev_ns }
+    Stats {
+        n,
+        min_ns,
+        p50_ns,
+        p95_ns,
+        max_ns,
+        mean_ns,
+        stddev_ns,
+    }
 }
 
 fn write_header(w: &mut BufWriter<File>) -> std::io::Result<()> {
@@ -86,30 +84,88 @@ fn write_header(w: &mut BufWriter<File>) -> std::io::Result<()> {
 }
 
 fn main() -> std::io::Result<()> {
-    let reg_file = File::create("tspa_reg.dat")?;
-    let auth_file = File::create("tspa_auth.dat")?;
+    let mut nsp_list: Vec<usize> = vec![20, 40, 60, 80, 100];
+    let mut tsp_abs: Option<Vec<usize>> = None;
+    let mut tsp_pct: Option<Vec<u32>> = Some(vec![20, 40, 60, 80, 100]);
+
+    let mut sample_size: usize = 2000;
+    let mut warmup_iters: usize = 300;
+
+    let mut reg_path: String = "tspa_reg.dat".to_string();
+    let mut auth_path: String = "tspa_auth.dat".to_string();
+
+    let mut args = std::env::args().skip(1);
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--nsp" => nsp_list = parse_list_usize(&args.next().expect("missing --nsp value")),
+            "--tsp" => {
+                tsp_abs = Some(parse_list_usize(&args.next().expect("missing --tsp value")));
+                tsp_pct = None;
+            }
+            "--tsp-pct" => {
+                tsp_pct = Some(parse_list_u32(&args.next().expect("missing --tsp-pct value")));
+                tsp_abs = None;
+            }
+            "--sample-size" => sample_size = args.next().expect("missing --sample-size").parse().unwrap(),
+            "--warmup-iters" => warmup_iters = args.next().expect("missing --warmup-iters").parse().unwrap(),
+            "--reg-out" => reg_path = args.next().expect("missing --reg-out"),
+            "--auth-out" => auth_path = args.next().expect("missing --auth-out"),
+            "--out-prefix" => {
+                let p = args.next().expect("missing --out-prefix");
+                reg_path = format!("{p}_reg.dat");
+                auth_path = format!("{p}_auth.dat");
+            }
+            "--bench" => {
+                let _ = args.next();
+            }
+            _ if a.starts_with('-') => {}
+            _ => {}
+        }
+    }
+
+    let reg_file = File::create(reg_path)?;
+    let auth_file = File::create(auth_path)?;
     let mut reg_out = BufWriter::new(reg_file);
     let mut auth_out = BufWriter::new(auth_file);
 
     write_header(&mut reg_out)?;
     write_header(&mut auth_out)?;
 
-    for (nsp, tsp_) in grid_5x5() {
+    let mut points: Vec<(usize, usize, u32)> = Vec::new();
+    for &nsp in &nsp_list {
+        if let Some(ts) = &tsp_abs {
+            for &t in ts {
+                if (1..=nsp).contains(&t) {
+                    points.push((nsp, t, t as u32));
+                }
+            }
+        } else if let Some(pcts) = &tsp_pct {
+            for &pct in pcts {
+                let mut t = (nsp * pct as usize) / 100;
+                if t < 1 {
+                    t = 1;
+                }
+                if t > nsp {
+                    t = nsp;
+                }
+                points.push((nsp, t, pct));
+            }
+        }
+    }
+
+    for (nsp, tsp_, _label) in points {
         let fx = tspa::make_fixture(nsp, tsp_);
 
-        let mut rng_reg =
-            ChaCha20Rng::from_seed(seed_for(b"tspa/manual/reg_rng/v2", nsp, tsp_));
-        let mut rng_auth =
-            ChaCha20Rng::from_seed(seed_for(b"tspa/manual/auth_rng/v2", nsp, tsp_));
+        let mut rng_reg = ChaCha20Rng::from_seed(seed_for(b"tspa/manual/reg_rng/v2", nsp, tsp_));
+        let mut rng_auth = ChaCha20Rng::from_seed(seed_for(b"tspa/manual/auth_rng/v2", nsp, tsp_));
 
-        // ---- Registration (client side) ----
-        for _ in 0..WARMUP_ITERS {
+        for _ in 0..warmup_iters {
             let it = tspa::make_iter_data(&fx, &mut rng_reg);
             let _ = tspa::registration_user_side(&fx, &it);
         }
 
-        let mut reg_samples = Vec::with_capacity(SAMPLES);
-        for _ in 0..SAMPLES {
+        let mut reg_samples = Vec::with_capacity(sample_size);
+        for _ in 0..sample_size {
             let it = tspa::make_iter_data(&fx, &mut rng_reg);
             let t0 = Instant::now();
             let out = tspa::registration_user_side(&fx, &it);
@@ -121,14 +177,20 @@ fn main() -> std::io::Result<()> {
         writeln!(
             &mut reg_out,
             "{} {} {} {} {} {} {} {} {:.3} {:.3}",
-            nsp, tsp_, reg_stats.n, WARMUP_ITERS,
-            reg_stats.min_ns, reg_stats.p50_ns, reg_stats.p95_ns, reg_stats.max_ns,
-            reg_stats.mean_ns, reg_stats.stddev_ns
+            nsp,
+            tsp_,
+            reg_stats.n,
+            warmup_iters,
+            reg_stats.min_ns,
+            reg_stats.p50_ns,
+            reg_stats.p95_ns,
+            reg_stats.max_ns,
+            reg_stats.mean_ns,
+            reg_stats.stddev_ns
         )?;
         reg_out.flush()?;
 
-        // ---- Authentication (client-side timing only: prepare + finish) ----
-        for _ in 0..WARMUP_ITERS {
+        for _ in 0..warmup_iters {
             let it = tspa::make_iter_data(&fx, &mut rng_auth);
 
             let (_uid, reqs) = tspa::auth_client_prepare(&fx, &it, &mut rng_auth);
@@ -142,8 +204,8 @@ fn main() -> std::io::Result<()> {
             std::hint::black_box(out);
         }
 
-        let mut auth_samples = Vec::with_capacity(SAMPLES);
-        for _ in 0..SAMPLES {
+        let mut auth_samples = Vec::with_capacity(sample_size);
+        for _ in 0..sample_size {
             let it = tspa::make_iter_data(&fx, &mut rng_auth);
 
             let t0 = Instant::now();
@@ -168,9 +230,16 @@ fn main() -> std::io::Result<()> {
         writeln!(
             &mut auth_out,
             "{} {} {} {} {} {} {} {} {:.3} {:.3}",
-            nsp, tsp_, auth_stats.n, WARMUP_ITERS,
-            auth_stats.min_ns, auth_stats.p50_ns, auth_stats.p95_ns, auth_stats.max_ns,
-            auth_stats.mean_ns, auth_stats.stddev_ns
+            nsp,
+            tsp_,
+            auth_stats.n,
+            warmup_iters,
+            auth_stats.min_ns,
+            auth_stats.p50_ns,
+            auth_stats.p95_ns,
+            auth_stats.max_ns,
+            auth_stats.mean_ns,
+            auth_stats.stddev_ns
         )?;
         auth_out.flush()?;
 

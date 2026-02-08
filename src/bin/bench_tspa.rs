@@ -1,5 +1,3 @@
-// src/bin/tspa_manual_bench.rs
-
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::time::Instant;
@@ -13,7 +11,7 @@ use tspa::protocols::tspa;
 const WARMUP_ITERS: usize = 300;
 const SAMPLES: usize = 2000;
 
-// 5x5 grid: nsp 15..55 step 10, tsp% 20..100 step 20
+// 5x5 grid: nsp 20..100 step 20, tsp% 20..100 step 20
 const NSP_START: usize = 20;
 const NSP_END: usize = 100;
 const NSP_STEP: usize = 20;

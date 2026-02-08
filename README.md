@@ -4,13 +4,12 @@
 
 This repository contains a small **Rust** crate (`tspa`) together with **manual, reproducible micro-benchmarks** for evaluating **user-side costs** of threshold password authentication schemes.
 
-Benchmarks are intentionally implemented **without Criterion** and instead rely on:
+Benchmarks are implemented on these parameters:
 
 * fixed warmup + sample counts,
 * deterministic RNG seeding,
 * explicit CLI parameters,
 
-so results are stable, scriptable, and suitable for **papers, tables, and plots**.
 
 ---
 
@@ -39,12 +38,20 @@ User-side setup / key-generation cost.
 All benchmarks measure **local computation only** (no networking).
 
 ---
+### Implementation primitives
 
+* Group: `ristretto255` instantiated via Curve25519 (Ristretto)
+* Hash function: `BLAKE3`
+
+For **TSPA**, we instantiate a non-threshold OPRF over `ristretto255` and protect stored client state and per-server records using **AES-256 in CTR mode**.
+
+For **UpSPA**, we instantiate a threshold OPRF over `ristretto255` and protect client state and per-server records using **XChaCha20-Poly1305** authenticated encryption. Authenticated updates during password changes use **Ed25519** digital signatures.
+
+---
 ## Repository layout
 ```
 UpSpa_benchmark/
 ├── Cargo.toml
-├── Cargo.lock
 ├── README.md
 ├── Dockerfile.yml
 └── src/
@@ -231,7 +238,7 @@ docker run --rm \
 
 Results appear in `./out/`.
 
----
+
 
 ### Run TSPA benchmark
 
@@ -258,4 +265,10 @@ docker run --rm \
 ```
 
 ---
+
+
+
+
+
+
 

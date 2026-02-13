@@ -1,306 +1,215 @@
+use crate::crypto_tspa as crypto;
+use crate::crypto::AES_IV_LEN;
 use blake3;
-use chacha20poly1305::aead::{Aead, KeyInit};
-use chacha20poly1305::{ChaCha20Poly1305, Nonce};
-use curve25519_dalek::ristretto::RistrettoPoint;
-use curve25519_dalek::scalar::Scalar;
+use curve25519_dalek::{ristretto::RistrettoPoint, scalar::Scalar};
 use rand_chacha::ChaCha20Rng;
 use rand_core::{RngCore, SeedableRng};
-use std::io::Read;
+use std::hint::black_box;
 
-
-fn h32(label: &[u8], parts: &[&[u8]]) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(label);
-    for p in parts {
-        hasher.update(p);
-    }
-    let out = hasher.finalize();
-    let mut r = [0u8; 32];
-    r.copy_from_slice(out.as_bytes());
-    r
-}
-
-fn blake3_xof_64(h: blake3::Hasher) -> [u8; 64] {
-    let mut out = [0u8; 64];
-    let mut reader = h.finalize_xof();
-    reader.read_exact(&mut out).expect("blake3 xof read failed");
-    out
-}
-
-fn scalar_random(rng: &mut impl RngCore) -> Scalar {
-    let mut wide = [0u8; 64];
-    rng.fill_bytes(&mut wide);
-    Scalar::from_bytes_mod_order_wide(&wide)
-}
-
-
-pub fn stor_uid(user_id: &[u8], ls_domain: &[u8]) -> [u8; 32] {
-    h32(b"tspa:storuid:v1", &[user_id, ls_domain])
-}
-
-pub fn vinfo(rnd_bytes: &[u8], ls_domain: &[u8]) -> [u8; 32] {
-    h32(b"tspa:vinfo:v1", &[rnd_bytes, ls_domain])
-}
-
-
-fn hash_to_point(pwd: &[u8]) -> RistrettoPoint {
-    let mut h = blake3::Hasher::new();
-    h.update(b"tspa:hash2point:v1");
-    h.update(pwd);
-    let wide = blake3_xof_64(h);
-    RistrettoPoint::from_uniform_bytes(&wide)
-}
-
-#[derive(Clone)]
-pub struct OprfRequest {
-    pub blinded: RistrettoPoint,
-    pub blind_inv: Scalar,
-}
-
-fn oprf_receiver_prepare(pwd: &[u8], rng: &mut impl RngCore) -> OprfRequest {
-    let p = hash_to_point(pwd);
-    let r = scalar_random(rng);
-    let blinded = p * r;
-    let blind_inv = r.invert();
-    OprfRequest { blinded, blind_inv }
-}
-
-fn oprf_sender_eval(k_i: &Scalar, blinded: &RistrettoPoint) -> RistrettoPoint {
-    blinded * k_i
-}
-
-fn oprf_receiver_finish(req: &OprfRequest, evaluated: &RistrettoPoint) -> [u8; 32] {
-    let y = evaluated * req.blind_inv; // = k_i * H(pwd)
-    let y_bytes = y.compress().to_bytes();
-    h32(b"tspa:oprf-out:v1", &[&y_bytes])
-}
-
-
-fn aead_encrypt_share(key32: &[u8; 32], nonce12: &[u8; 12], share_y: &Scalar) -> Vec<u8> {
-    let aead = ChaCha20Poly1305::new(key32.into());
-    let nonce = Nonce::from_slice(nonce12);
-    let pt = share_y.to_bytes();
-    let mut ct = aead.encrypt(nonce, pt.as_ref()).expect("encrypt failed");
-
-    let mut out = Vec::with_capacity(12 + ct.len());
-    out.extend_from_slice(nonce12);
-    out.append(&mut ct);
-    out
-}
-
-fn aead_decrypt_share(key32: &[u8; 32], blob: &[u8]) -> Scalar {
-    assert!(blob.len() >= 12, "ciphertext too short");
-    let (nonce12, ct) = blob.split_at(12);
-    let aead = ChaCha20Poly1305::new(key32.into());
-    let nonce = Nonce::from_slice(nonce12);
-    let pt = aead.decrypt(nonce, ct).expect("decrypt failed");
-
-    let mut b = [0u8; 32];
-    b.copy_from_slice(&pt[..32]);
-    Scalar::from_bytes_mod_order(b)
-}
-
-
-#[derive(Clone)]
-struct Share {
-    x: Scalar,
-    y: Scalar,
-}
-
-fn poly_eval(coeffs: &[Scalar], x: Scalar) -> Scalar {
-    let mut acc = Scalar::ZERO;
-    let mut pow = Scalar::ONE;
-    for c in coeffs {
-        acc += c * pow;
-        pow *= x;
-    }
-    acc
-}
-
-fn shamir_reconstruct_zero(shares: &[Share]) -> Scalar {
-    let mut secret = Scalar::ZERO;
-
-    for i in 0..shares.len() {
-        let xi = shares[i].x;
-        let yi = shares[i].y;
-
-        let mut num = Scalar::ONE;
-        let mut den = Scalar::ONE;
-
-        for j in 0..shares.len() {
-            if i == j {
-                continue;
-            }
-            let xj = shares[j].x;
-            num *= xj;
-            den *= xj - xi;
-        }
-
-        let li0 = num * den.invert();
-        secret += yi * li0;
-    }
-
-    secret
-}
-
-
-#[derive(Clone)]
-pub struct SpRecord {
-    pub x: u16,
-    pub k_i: Scalar,
-    pub c_i: Vec<u8>,
-}
-
-
-#[derive(Clone)]
-pub struct IterData {
-    pub sp_indices: Vec<usize>, 
-    pub iter_seed: [u8; 32],    
-}
-
-#[derive(Clone)]
-pub struct SpAuthResponse {
-    pub x: u16,
-    pub evaluated: RistrettoPoint,
-    pub c_i: Vec<u8>,
-}
-
-
-
-fn seed_for(tag: &[u8], nsp: usize, tsp: usize) -> [u8; 32] {
-    let mut h = blake3::Hasher::new();
-    h.update(tag);
-    h.update(&nsp.to_le_bytes());
-    h.update(&tsp.to_le_bytes());
-    let out = h.finalize();
-    let mut s = [0u8; 32];
-    s.copy_from_slice(out.as_bytes());
-    s
-}
-
-pub fn make_iter_data(fx: &Fixture, rng: &mut impl RngCore) -> IterData {
-    let mut sp_indices = Vec::with_capacity(fx.tsp);
-    for i in 0..fx.tsp {
-        sp_indices.push(i);
-    }
-
-    let mut iter_seed = [0u8; 32];
-    rng.fill_bytes(&mut iter_seed);
-
-    IterData { sp_indices, iter_seed }
-}
-
-
-pub fn auth_sp_process(fx: &Fixture, sp_index: usize, req: &OprfRequest) -> SpAuthResponse {
-    let sp = &fx.sp_db[sp_index];
-    let evaluated = oprf_sender_eval(&sp.k_i, &req.blinded);
-    SpAuthResponse { x: sp.x, evaluated, c_i: sp.c_i.clone() }
-}
-
-pub fn auth_client_finish(fx: &Fixture, reqs: &[OprfRequest], resps: &[SpAuthResponse]) -> [u8; 32] {
-    assert_eq!(reqs.len(), resps.len());
-
-    let mut shares = Vec::with_capacity(reqs.len());
-    for i in 0..reqs.len() {
-        let key32 = oprf_receiver_finish(&reqs[i], &resps[i].evaluated);
-        let y = aead_decrypt_share(&key32, &resps[i].c_i);
-        let x = Scalar::from(resps[i].x as u64);
-        shares.push(Share { x, y });
-    }
-
-    let rnd = shamir_reconstruct_zero(&shares);
-    vinfo(&rnd.to_bytes(), &fx.ls_domain)
-}
-
-
-pub fn authentication_user_side(fx: &Fixture, it: &IterData) -> [u8; 32] {
-    let mut rng = ChaCha20Rng::from_seed(seed_for(b"tspa:auth-client-rng:v3", fx.nsp, fx.tsp));
-    let (_uid, reqs) = auth_client_prepare(fx, it, &mut rng);
-
-    let mut resps = Vec::with_capacity(reqs.len());
-    for (j, sp_index) in it.sp_indices.iter().enumerate() {
-        resps.push(auth_sp_process(fx, *sp_index, &reqs[j]));
-    }
-
-    auth_client_finish(fx, &reqs, &resps)
-}
-
-fn oprf_key_direct_from_k(pwd_point: &RistrettoPoint, k_i: &Scalar) -> [u8; 32] {
-    let y = pwd_point * k_i;
-    let y_bytes = y.compress().to_bytes();
-    h32(b"tspa:oprf-out:v1", &[&y_bytes])
-}
-
-fn oprf_receiver_prepare_from_point(pwd_point: &RistrettoPoint, rng: &mut impl RngCore) -> OprfRequest {
-    let r = scalar_random(rng);
-    let blinded = pwd_point * r;
-    let blind_inv = r.invert();
-    OprfRequest { blinded, blind_inv }
-}
-
+/// Ciphertext layout: iv(16) || ct(32) = 48 bytes
+pub type Ciphertext = [u8; 48];
 
 #[derive(Clone)]
 pub struct Fixture {
     pub nsp: usize,
     pub tsp: usize,
-    pub user_id: Vec<u8>,
-    pub ls_domain: Vec<u8>,
+
+    pub uid: Vec<u8>,
+    pub lsj: Vec<u8>,
     pub password: Vec<u8>,
-    pub pwd_point: RistrettoPoint, 
-    pub sp_db: Vec<SpRecord>,
+    pub pwd_point: RistrettoPoint,
+
+    // x coords 1..=nsp, and lambdas for 1..=tsp at zero
+    pub x_all: Vec<Scalar>,
+    pub lambdas_sel: Vec<Scalar>,
+
+    // Stored LS value (verification info)
+    pub vinfo_db: [u8; 32],
+
+    // Stored SP records (what client would fetch during auth) for first tsp providers
+    pub auth_ciphertexts_sel: Vec<Ciphertext>, // length tsp
+    pub auth_oprf_keys_sel: Vec<Scalar>,       // length tsp (only for generating Z outside timing)
+}
+
+pub struct IterData<'a> {
+    // Registration randomness (prepared outside timing)
+    pub reg_coeffs: Vec<Scalar>,    // degree t-1, coeffs[0] = rnd
+    pub reg_oprf_keys: Vec<Scalar>, // length nsp
+    pub reg_ivs: Vec<[u8; AES_IV_LEN]>, // length nsp
+
+    // Authentication randomness + “server replies” (prepared outside timing)
+    pub auth_r: Scalar,
+    pub auth_z_sel: Vec<RistrettoPoint>, // length tsp
+
+    // Borrowed from fixture
+    pub auth_ciphertexts_sel: &'a [Ciphertext],
+}
+
+fn seed_bytes(tag: &[u8], nsp: usize, tsp: usize) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(tag);
+    h.update(&nsp.to_le_bytes());
+    h.update(&tsp.to_le_bytes());
+    *h.finalize().as_bytes()
+}
+
+fn pack_ciphertext(iv: [u8; 16], ct: [u8; 32]) -> Ciphertext {
+    let mut out = [0u8; 48];
+    out[..16].copy_from_slice(&iv);
+    out[16..].copy_from_slice(&ct);
+    out
+}
+fn unpack_ciphertext(c: Ciphertext) -> ([u8; 16], [u8; 32]) {
+    let mut iv = [0u8; 16];
+    let mut ct = [0u8; 32];
+    iv.copy_from_slice(&c[..16]);
+    ct.copy_from_slice(&c[16..]);
+    (iv, ct)
 }
 
 pub fn make_fixture(nsp: usize, tsp: usize) -> Fixture {
-    let mut rng = ChaCha20Rng::from_seed(seed_for(b"tspa:fixture:v4", nsp, tsp));
+    assert!(tsp >= 1 && tsp <= nsp);
 
-    let user_id = b"alice".to_vec();
-    let ls_domain = b"example.com".to_vec();
-    let password = b"correct horse battery staple".to_vec();
-    let pwd_point = hash_to_point(&password);
-    let rnd = scalar_random(&mut rng);
+    let seed = seed_bytes(b"tspa/fixture_seed/v1", nsp, tsp);
+    let mut rng = ChaCha20Rng::from_seed(seed);
+
+    let uid = b"user123".to_vec();
+    let lsj = b"LS1".to_vec();
+    let password = b"benchmark password".to_vec();
+    let pwd_point = crypto::hash_to_point(&password);
+
+    // x coordinates 1..=nsp
+    let mut x_all = Vec::with_capacity(nsp);
+    for i in 1..=nsp {
+        x_all.push(Scalar::from(i as u64));
+    }
+
+    // selected x 1..=tsp
+    let mut x_sel = Vec::with_capacity(tsp);
+    for i in 1..=tsp {
+        x_sel.push(Scalar::from(i as u64));
+    }
+    let lambdas_sel = crypto::lagrange_lambdas_at_zero(&x_sel);
+
+    // Create a “stored record” for auth: choose rnd, share it, choose per-SP keys, encrypt shares.
+    let secret_rnd = crypto::random_scalar(&mut rng);
 
     let mut coeffs = Vec::with_capacity(tsp);
-    coeffs.push(rnd);
+    coeffs.push(secret_rnd);
     for _ in 1..tsp {
-        coeffs.push(scalar_random(&mut rng));
+        coeffs.push(crypto::random_scalar(&mut rng));
     }
 
-    let mut sp_db = Vec::with_capacity(nsp);
-    for i in 0..nsp {
-        let x_u16 = (i as u16) + 1;
-        let x = Scalar::from(x_u16 as u64);
-        let y = poly_eval(&coeffs, x);
-        let k_i = scalar_random(&mut rng);
-        let key32 = oprf_key_direct_from_k(&pwd_point, &k_i);
-        let mut nonce12 = [0u8; 12];
-        rng.fill_bytes(&mut nonce12);
-        let c_i = aead_encrypt_share(&key32, &nonce12, &y);
-        sp_db.push(SpRecord { x: x_u16, k_i, c_i });
+    let mut oprf_keys_all = Vec::with_capacity(nsp);
+    for _ in 0..nsp {
+        oprf_keys_all.push(crypto::random_scalar(&mut rng));
     }
 
-    Fixture { nsp, tsp, user_id, ls_domain, password, pwd_point, sp_db }
+    // build ciphertexts for the first tsp providers
+    let mut auth_ciphertexts_sel = Vec::with_capacity(tsp);
+    for j in 0..tsp {
+        let k = oprf_keys_all[j];
+
+        // unblinded OPRF output: Y = P*k
+        let y = pwd_point * k;
+        let key = crypto::oprf_finalize(&password, &y);
+
+        // share at x=j+1
+        let share = crypto::eval_poly(&coeffs, x_all[j]);
+        let share_bytes = share.to_bytes();
+
+        let iv = crypto::rand_bytes::<16>(&mut rng);
+        let ct = crypto::aes256ctr_xor_32(key, iv, share_bytes);
+        auth_ciphertexts_sel.push(pack_ciphertext(iv, ct));
+    }
+
+    let auth_oprf_keys_sel = oprf_keys_all[..tsp].to_vec();
+
+    // stored LS verification info
+    let vinfo_db = crypto::hash_vinfo(&secret_rnd.to_bytes(), &lsj);
+
+    Fixture {
+        nsp,
+        tsp,
+        uid,
+        lsj,
+        password,
+        pwd_point,
+        x_all,
+        lambdas_sel,
+        vinfo_db,
+        auth_ciphertexts_sel,
+        auth_oprf_keys_sel,
+    }
 }
 
-pub fn registration_user_side(fx: &Fixture, it: &IterData) -> [u8; 32] {
-    let mut rng = ChaCha20Rng::from_seed(it.iter_seed);
-    let _uid = stor_uid(&fx.user_id, &fx.ls_domain);
-    let rnd = scalar_random(&mut rng);
-    let mut coeffs = Vec::with_capacity(fx.tsp);
-    coeffs.push(rnd);
+/// Prepare per-iteration randomness (NOT timed by the benchmark binary).
+pub fn make_iter_data<'a>(fx: &'a Fixture, rng: &mut impl RngCore) -> IterData<'a> {
+    // Registration randomness
+    let mut reg_coeffs = Vec::with_capacity(fx.tsp);
+    reg_coeffs.push(crypto::random_scalar(rng)); // rnd
     for _ in 1..fx.tsp {
-        coeffs.push(scalar_random(&mut rng));
+        reg_coeffs.push(crypto::random_scalar(rng));
     }
+
+    let mut reg_oprf_keys = Vec::with_capacity(fx.nsp);
+    for _ in 0..fx.nsp {
+        reg_oprf_keys.push(crypto::random_scalar(rng));
+    }
+
+    let mut reg_ivs = Vec::with_capacity(fx.nsp);
+    for _ in 0..fx.nsp {
+        reg_ivs.push(crypto::rand_bytes::<16>(rng));
+    }
+
+    // Authentication “server replies”
+    let auth_r = crypto::random_scalar(rng);
+    let blinded = fx.pwd_point * auth_r;
+
+    let mut auth_z_sel = Vec::with_capacity(fx.tsp);
+    for j in 0..fx.tsp {
+        // Z_j = (P*r) * k_j  (server-side), prepared outside timing
+        auth_z_sel.push(blinded * fx.auth_oprf_keys_sel[j]);
+    }
+
+    IterData {
+        reg_coeffs,
+        reg_oprf_keys,
+        reg_ivs,
+        auth_r,
+        auth_z_sel,
+        auth_ciphertexts_sel: &fx.auth_ciphertexts_sel,
+    }
+}
+
+/// Registration (client-side only), timed by bench.
+/// Uses pre-generated randomness from IterData.
+pub fn registration_user_side(fx: &Fixture, it: &IterData<'_>) -> [u8; 32] {
+    let stor_uid = crypto::hash_storuid(&fx.uid, &fx.lsj);
+
+    let rnd_bytes = it.reg_coeffs[0].to_bytes();
+    let vinfo = crypto::hash_vinfo(&rnd_bytes, &fx.lsj);
+
     let mut acc = blake3::Hasher::new();
-    acc.update(b"tspa:reg:acc:v2");
+    acc.update(b"tspa/registration/acc/v1");
+    acc.update(&stor_uid);
+    acc.update(&vinfo);
+
     for i in 0..fx.nsp {
-        let sp = &fx.sp_db[i];
-        let x = Scalar::from(sp.x as u64);
-        let share_y = poly_eval(&coeffs, x);
-        let key32 = oprf_key_direct_from_k(&fx.pwd_point, &sp.k_i);
-        let mut nonce12 = [0u8; 12];
-        rng.fill_bytes(&mut nonce12);
-        let c_i = aead_encrypt_share(&key32, &nonce12, &share_y);
-        acc.update(&c_i);
+        let k_i = it.reg_oprf_keys[i];
+
+        // registration-time: client can compute unblinded OPRF output directly
+        let y = fx.pwd_point * k_i;
+        let key = crypto::oprf_finalize(&fx.password, &y);
+
+        let share = crypto::eval_poly(&it.reg_coeffs, fx.x_all[i]);
+        let share_bytes = share.to_bytes();
+
+        let iv = it.reg_ivs[i];
+        let ct = crypto::aes256ctr_xor_32(key, iv, share_bytes);
+        let c = pack_ciphertext(iv, ct);
+
+        acc.update(&c);
     }
 
     let out = acc.finalize();
@@ -308,17 +217,47 @@ pub fn registration_user_side(fx: &Fixture, it: &IterData) -> [u8; 32] {
     r.copy_from_slice(out.as_bytes());
     r
 }
-pub fn auth_client_prepare(
-    fx: &Fixture,
-    it: &IterData,
-    rng: &mut impl RngCore,
-) -> ([u8; 32], Vec<OprfRequest>) {
-    let uid = stor_uid(&fx.user_id, &fx.ls_domain);
 
-    let mut reqs = Vec::with_capacity(it.sp_indices.len());
-    for _ in 0..it.sp_indices.len() {
-        reqs.push(oprf_receiver_prepare_from_point(&fx.pwd_point, rng));
+/// Authentication (client-side only), timed by bench.
+/// Uses pre-fetched ciphertexts and pre-generated server replies Z_j from IterData.
+pub fn authentication_user_side(fx: &Fixture, it: &IterData<'_>) -> [u8; 32] {
+    let stor_uid = crypto::hash_storuid(&fx.uid, &fx.lsj);
+
+    // include “blind” structure parity in timed region
+    let b = fx.pwd_point * it.auth_r;
+    black_box(b);
+
+    let r_inv = it.auth_r.invert();
+
+    let mut acc_rnd = Scalar::ZERO;
+
+    for j in 0..fx.tsp {
+        // unblind: Y = Z * r^{-1} = P*k
+        let y = it.auth_z_sel[j] * r_inv;
+        let key = crypto::oprf_finalize(&fx.password, &y);
+
+        // decrypt share
+        let c = it.auth_ciphertexts_sel[j];
+        let (iv, ct) = unpack_ciphertext(c);
+        let pt = crypto::aes256ctr_xor_32(key, iv, ct);
+
+        let share = Scalar::from_bytes_mod_order(pt);
+        acc_rnd += share * fx.lambdas_sel[j];
     }
 
-    (uid, reqs)
+    let recovered_rnd = acc_rnd.to_bytes();
+    let vinfo = crypto::hash_vinfo(&recovered_rnd, &fx.lsj);
+    let ok = vinfo == fx.vinfo_db;
+
+    let mut h = blake3::Hasher::new();
+    h.update(b"tspa/auth/acc/v1");
+    h.update(&stor_uid);
+    h.update(&recovered_rnd);
+    h.update(&vinfo);
+    h.update(&[ok as u8]);
+
+    let out = h.finalize();
+    let mut r = [0u8; 32];
+    r.copy_from_slice(out.as_bytes());
+    r
 }

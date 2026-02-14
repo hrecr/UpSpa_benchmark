@@ -1,5 +1,5 @@
 use crate::crypto_tspa as crypto;
-use crate::crypto::AES_IV_LEN;
+use crate::crypto_tspa::{AES_IV_LEN};
 use blake3;
 use curve25519_dalek::{ristretto::RistrettoPoint, scalar::Scalar};
 use rand_chacha::ChaCha20Rng;
@@ -261,3 +261,4 @@ pub fn authentication_user_side(fx: &Fixture, it: &IterData<'_>) -> [u8; 32] {
     r.copy_from_slice(out.as_bytes());
     r
 }
+

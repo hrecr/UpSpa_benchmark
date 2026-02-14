@@ -2,30 +2,23 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::time::Instant;
 
-use blake3;
 use rand_chacha::ChaCha20Rng;
 use rand_core::SeedableRng;
 
 use tspa::protocols::tspa;
 
 fn parse_list_usize(s: &str) -> Vec<usize> {
-    s.split(',')
-        .filter(|x| !x.trim().is_empty())
-        .map(|x| x.trim().parse().unwrap())
-        .collect()
+    s.split(',').filter(|x| !x.trim().is_empty()).map(|x| x.trim().parse().unwrap()).collect()
 }
 fn parse_list_u32(s: &str) -> Vec<u32> {
-    s.split(',')
-        .filter(|x| !x.trim().is_empty())
-        .map(|x| x.trim().parse().unwrap())
-        .collect()
+    s.split(',').filter(|x| !x.trim().is_empty()).map(|x| x.trim().parse().unwrap()).collect()
 }
 
-fn seed_for(tag: &[u8], nsp: usize, tsp_: usize) -> [u8; 32] {
+fn seed_for(tag: &[u8], nsp: usize, tsp: usize) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(tag);
     h.update(&nsp.to_le_bytes());
-    h.update(&tsp_.to_le_bytes());
+    h.update(&tsp.to_le_bytes());
     let out = h.finalize();
     let mut s = [0u8; 32];
     s.copy_from_slice(out.as_bytes());
@@ -59,41 +52,26 @@ fn compute_stats(mut xs: Vec<u128>) -> Stats {
         let d = (x as f64) - mean_ns;
         var += d * d;
     }
-    let stddev_ns = if n > 1 {
-        (var / ((n - 1) as f64)).sqrt()
-    } else {
-        0.0
-    };
+    let stddev_ns = if n > 1 { (var / ((n - 1) as f64)).sqrt() } else { 0.0 };
 
-    Stats {
-        n,
-        min_ns,
-        p50_ns,
-        p95_ns,
-        max_ns,
-        mean_ns,
-        stddev_ns,
-    }
+    Stats { n, min_ns, p50_ns, p95_ns, max_ns, mean_ns, stddev_ns }
 }
 
 fn write_header(w: &mut BufWriter<File>) -> std::io::Result<()> {
-    writeln!(
-        w,
-        "nsp tsp samples warmup min_ns p50_ns p95_ns max_ns mean_ns stddev_ns"
-    )
+    writeln!(w, "nsp tsp samples warmup min_ns p50_ns p95_ns max_ns mean_ns stddev_ns")
 }
 
 fn main() -> std::io::Result<()> {
+    // defaults (same spirit as your UpSpa_benchmark CLI) :contentReference[oaicite:2]{index=2}
     let mut nsp_list: Vec<usize> = vec![20, 40, 60, 80, 100];
     let mut tsp_abs: Option<Vec<usize>> = None;
     let mut tsp_pct: Option<Vec<u32>> = Some(vec![20, 40, 60, 80, 100]);
 
     let mut sample_size: usize = 2000;
     let mut warmup_iters: usize = 300;
+    let mut out_prefix: String = "tspa".to_string();
 
-    let mut reg_path: String = "tspa_reg.dat".to_string();
-    let mut auth_path: String = "tspa_auth.dat".to_string();
-
+    // tolerant CLI (ignores cargo/libtest flags)
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -106,59 +84,49 @@ fn main() -> std::io::Result<()> {
                 tsp_pct = Some(parse_list_u32(&args.next().expect("missing --tsp-pct value")));
                 tsp_abs = None;
             }
-            "--sample-size" => sample_size = args.next().expect("missing --sample-size").parse().unwrap(),
-            "--warmup-iters" => warmup_iters = args.next().expect("missing --warmup-iters").parse().unwrap(),
-            "--reg-out" => reg_path = args.next().expect("missing --reg-out"),
-            "--auth-out" => auth_path = args.next().expect("missing --auth-out"),
-            "--out-prefix" => {
-                let p = args.next().expect("missing --out-prefix");
-                reg_path = format!("{p}_reg.dat");
-                auth_path = format!("{p}_auth.dat");
-            }
-            "--bench" => {
-                let _ = args.next();
-            }
+            "--sample-size" => sample_size = args.next().unwrap().parse().unwrap(),
+            "--warmup-iters" => warmup_iters = args.next().unwrap().parse().unwrap(),
+            "--out-prefix" => out_prefix = args.next().unwrap(),
+            "--bench" => { let _ = args.next(); } // windows cargo noise
             _ if a.starts_with('-') => {}
             _ => {}
         }
     }
 
-    let reg_file = File::create(reg_path)?;
-    let auth_file = File::create(auth_path)?;
+    let reg_file = File::create(format!("{out_prefix}_reg.dat"))?;
+    let auth_file = File::create(format!("{out_prefix}_auth.dat"))?;
     let mut reg_out = BufWriter::new(reg_file);
     let mut auth_out = BufWriter::new(auth_file);
 
     write_header(&mut reg_out)?;
     write_header(&mut auth_out)?;
 
-    let mut points: Vec<(usize, usize, u32)> = Vec::new();
+    // build points (nsp, tsp)
+    let mut points: Vec<(usize, usize)> = Vec::new();
     for &nsp in &nsp_list {
         if let Some(ts) = &tsp_abs {
             for &t in ts {
                 if (1..=nsp).contains(&t) {
-                    points.push((nsp, t, t as u32));
+                    points.push((nsp, t));
                 }
             }
         } else if let Some(pcts) = &tsp_pct {
             for &pct in pcts {
                 let mut t = (nsp * pct as usize) / 100;
-                if t < 1 {
-                    t = 1;
-                }
-                if t > nsp {
-                    t = nsp;
-                }
-                points.push((nsp, t, pct));
+                if t < 1 { t = 1; }
+                if t > nsp { t = nsp; }
+                points.push((nsp, t));
             }
         }
     }
 
-    for (nsp, tsp_, _label) in points {
+    for (nsp, tsp_) in points {
         let fx = tspa::make_fixture(nsp, tsp_);
 
-        let mut rng_reg = ChaCha20Rng::from_seed(seed_for(b"tspa/manual/reg_rng/v2", nsp, tsp_));
-        let mut rng_auth = ChaCha20Rng::from_seed(seed_for(b"tspa/manual/auth_rng/v2", nsp, tsp_));
+        let mut rng_reg = ChaCha20Rng::from_seed(seed_for(b"tspa/manual/reg_rng/v1", nsp, tsp_));
+        let mut rng_auth = ChaCha20Rng::from_seed(seed_for(b"tspa/manual/auth_rng/v1", nsp, tsp_));
 
+        // ---- Registration ----
         for _ in 0..warmup_iters {
             let it = tspa::make_iter_data(&fx, &mut rng_reg);
             let _ = tspa::registration_user_side(&fx, &it);
@@ -177,74 +145,39 @@ fn main() -> std::io::Result<()> {
         writeln!(
             &mut reg_out,
             "{} {} {} {} {} {} {} {} {:.3} {:.3}",
-            nsp,
-            tsp_,
-            reg_stats.n,
-            warmup_iters,
-            reg_stats.min_ns,
-            reg_stats.p50_ns,
-            reg_stats.p95_ns,
-            reg_stats.max_ns,
-            reg_stats.mean_ns,
-            reg_stats.stddev_ns
+            nsp, tsp_, reg_stats.n, warmup_iters,
+            reg_stats.min_ns, reg_stats.p50_ns, reg_stats.p95_ns, reg_stats.max_ns,
+            reg_stats.mean_ns, reg_stats.stddev_ns
         )?;
         reg_out.flush()?;
 
+        // ---- Authentication ----
         for _ in 0..warmup_iters {
             let it = tspa::make_iter_data(&fx, &mut rng_auth);
-
-            let (_uid, reqs) = tspa::auth_client_prepare(&fx, &it, &mut rng_auth);
-
-            let mut resps = Vec::with_capacity(reqs.len());
-            for (j, sp_index) in it.sp_indices.iter().enumerate() {
-                resps.push(tspa::auth_sp_process(&fx, *sp_index, &reqs[j]));
-            }
-
-            let out = tspa::auth_client_finish(&fx, &reqs, &resps);
-            std::hint::black_box(out);
+            let _ = tspa::authentication_user_side(&fx, &it);
         }
 
         let mut auth_samples = Vec::with_capacity(sample_size);
         for _ in 0..sample_size {
             let it = tspa::make_iter_data(&fx, &mut rng_auth);
-
             let t0 = Instant::now();
-            let (_uid, reqs) = tspa::auth_client_prepare(&fx, &it, &mut rng_auth);
-            let prep_ns = t0.elapsed().as_nanos();
-
-            let mut resps = Vec::with_capacity(reqs.len());
-            for (j, sp_index) in it.sp_indices.iter().enumerate() {
-                resps.push(tspa::auth_sp_process(&fx, *sp_index, &reqs[j]));
-            }
-
-            let t1 = Instant::now();
-            let out = tspa::auth_client_finish(&fx, &reqs, &resps);
+            let out = tspa::authentication_user_side(&fx, &it);
             std::hint::black_box(out);
-            let finish_ns = t1.elapsed().as_nanos();
-
-            auth_samples.push(prep_ns + finish_ns);
+            auth_samples.push(t0.elapsed().as_nanos());
         }
-
         let auth_stats = compute_stats(auth_samples);
 
         writeln!(
             &mut auth_out,
             "{} {} {} {} {} {} {} {} {:.3} {:.3}",
-            nsp,
-            tsp_,
-            auth_stats.n,
-            warmup_iters,
-            auth_stats.min_ns,
-            auth_stats.p50_ns,
-            auth_stats.p95_ns,
-            auth_stats.max_ns,
-            auth_stats.mean_ns,
-            auth_stats.stddev_ns
+            nsp, tsp_, auth_stats.n, warmup_iters,
+            auth_stats.min_ns, auth_stats.p50_ns, auth_stats.p95_ns, auth_stats.max_ns,
+            auth_stats.mean_ns, auth_stats.stddev_ns
         )?;
         auth_out.flush()?;
 
         eprintln!(
-            "done nsp={}, tsp={} | reg p50={} ns | auth(client) p50={} ns",
+            "done nsp={}, tsp={} | reg p50={} ns | auth p50={} ns",
             nsp, tsp_, reg_stats.p50_ns, auth_stats.p50_ns
         );
     }

@@ -603,3 +603,237 @@ fn bench_upspa(
         }
         write_row(out, scheme, "formula", "auth", rng_in_timed, nsp, tsp, warmup, &compute_stats(xs))?;
     }
+    // Primitives (UPSPA)
+    {
+        
+        let mut rng0 = ChaCha20Rng::from_seed(seed_for(b"unified/upspa/prim/derive/v1", nsp, tsp));
+        let it0 = upspa_proto::make_iter_data(&fx, &mut rng0);
+        let (state_key0, cipherid_pt0) = upspa_recover_state_and_cipherid_pt(&fx, &it0);
+        let (rsp0, fk0, _sid0) = upspa_extract_rsp_fk_sid(&cipherid_pt0);
+
+        // TOPRF (depends on tsp via partial count)
+        {
+            let mut rng = ChaCha20Rng::from_seed(seed_for(b"unified/upspa/prim/toprf/v1", nsp, tsp));
+            for _ in 0..warmup {
+                let it = upspa_proto::make_iter_data(&fx, &mut rng);
+                let b = &fx.pwd_point * it.r;
+                black_box(b);
+                let k = up_crypto::toprf_client_eval_from_partials(
+                    &fx.password,
+                    it.r,
+                    &it.partials,
+                    &fx.lagrange_at_zero,
+                );
+                black_box(k);
+            }
+            let mut xs = Vec::with_capacity(samples);
+            for _ in 0..samples {
+                let it = upspa_proto::make_iter_data(&fx, &mut rng);
+                let t0 = Instant::now();
+                let b = &fx.pwd_point * it.r;
+                black_box(b);
+                let k = up_crypto::toprf_client_eval_from_partials(
+                    &fx.password,
+                    it.r,
+                    &it.partials,
+                    &fx.lagrange_at_zero,
+                );
+                black_box(k);
+                xs.push(t0.elapsed().as_nanos());
+            }
+            write_row(out, scheme, "prim", "TOPRF_client_eval", rng_in_timed, nsp, tsp, warmup, &compute_stats(xs))?;
+        }
+
+        // AEAD dec cipherid
+        {
+            for _ in 0..warmup {
+                let pt = up_crypto::xchacha_decrypt_detached(&state_key0, &fx.cipherid_aad, &fx.cipherid).unwrap();
+                black_box(pt);
+            }
+            let mut xs = Vec::with_capacity(samples);
+            for _ in 0..samples {
+                let t0 = Instant::now();
+                let pt = up_crypto::xchacha_decrypt_detached(&state_key0, &fx.cipherid_aad, &fx.cipherid).unwrap();
+                black_box(pt);
+                xs.push(t0.elapsed().as_nanos());
+            }
+            write_row(out, scheme, "prim", "AEAD_DEC_cipherid", rng_in_timed, nsp, tsp, warmup, &compute_stats(xs))?;
+        }
+
+        // AEAD dec one ciphersp
+        {
+            let one = &fx.ciphersp_per_sp[0];
+            for _ in 0..warmup {
+                let pt = up_crypto::xchacha_decrypt_detached(&fk0, &fx.ciphersp_aad, one).unwrap();
+                black_box(pt);
+            }
+            let mut xs = Vec::with_capacity(samples);
+            for _ in 0..samples {
+                let t0 = Instant::now();
+                let pt = up_crypto::xchacha_decrypt_detached(&fk0, &fx.ciphersp_aad, one).unwrap();
+                black_box(pt);
+                xs.push(t0.elapsed().as_nanos());
+            }
+            write_row(out, scheme, "prim", "AEAD_DEC_ciphersp", rng_in_timed, nsp, tsp, warmup, &compute_stats(xs))?;
+        }
+
+        // AEAD enc ciphersp (rng optional)
+        {
+            let ctr: u64 = 0;
+            let mut pt = [0u8; upspa_proto::CIPHERSP_PT_LEN];
+            pt[0..32].copy_from_slice(&fx.cached_rlsj);
+            pt[32..40].copy_from_slice(&ctr.to_le_bytes());
+
+            if rng_in_timed {
+                let mut rng = ChaCha20Rng::from_seed(seed_for(b"unified/upspa/prim/aead_enc_rng/v1", nsp, tsp));
+                for _ in 0..warmup {
+                    let c = up_crypto::xchacha_encrypt_detached(&fk0, &fx.ciphersp_aad, &pt, &mut rng);
+                    black_box(c.ct);
+                    black_box(c.tag);
+                }
+                let mut xs = Vec::with_capacity(samples);
+                for _ in 0..samples {
+                    let t0 = Instant::now();
+                    let c = up_crypto::xchacha_encrypt_detached(&fk0, &fx.ciphersp_aad, &pt, &mut rng);
+                    black_box(c.ct);
+                    black_box(c.tag);
+                    xs.push(t0.elapsed().as_nanos());
+                }
+                write_row(out, scheme, "prim", "AEAD_ENC_ciphersp_with_rng", rng_in_timed, nsp, tsp, warmup, &compute_stats(xs))?;
+            } else {
+                let nonce = [0x42u8; up_crypto::NONCE_LEN];
+                for _ in 0..warmup {
+                    let c = upspa_aead_encrypt_fixed(&fk0, &fx.ciphersp_aad, &pt, nonce);
+                    black_box(c.ct);
+                    black_box(c.tag);
+                }
+                let mut xs = Vec::with_capacity(samples);
+                for _ in 0..samples {
+                    let t0 = Instant::now();
+                    let c = upspa_aead_encrypt_fixed(&fk0, &fx.ciphersp_aad, &pt, nonce);
+                    black_box(c.ct);
+                    black_box(c.tag);
+                    xs.push(t0.elapsed().as_nanos());
+                }
+                write_row(out, scheme, "prim", "AEAD_ENC_ciphersp_fixed_nonce", rng_in_timed, nsp, tsp, warmup, &compute_stats(xs))?;
+            }
+        }
+
+        // HASH suid
+        {
+            for _ in 0..warmup {
+                let h = up_crypto::hash_suid(&rsp0, &fx.lsj, 1);
+                black_box(h);
+            }
+            let mut xs = Vec::with_capacity(samples);
+            for _ in 0..samples {
+                let t0 = Instant::now();
+                let h = up_crypto::hash_suid(&rsp0, &fx.lsj, 1);
+                black_box(h);
+                xs.push(t0.elapsed().as_nanos());
+            }
+            write_row(out, scheme, "prim", "HASH_suid", rng_in_timed, nsp, tsp, warmup, &compute_stats(xs))?;
+        }
+
+        // HASH vinfo
+        {
+            for _ in 0..warmup {
+                let h = up_crypto::hash_vinfo(&fx.cached_rlsj, &fx.lsj);
+                black_box(h);
+            }
+            let mut xs = Vec::with_capacity(samples);
+            for _ in 0..samples {
+                let t0 = Instant::now();
+                let h = up_crypto::hash_vinfo(&fx.cached_rlsj, &fx.lsj);
+                black_box(h);
+                xs.push(t0.elapsed().as_nanos());
+            }
+            write_row(out, scheme, "prim", "HASH_vinfo", rng_in_timed, nsp, tsp, warmup, &compute_stats(xs))?;
+        }
+    }
+
+    Ok(())
+}
+
+fn bench_tspa(
+    nsp: usize,
+    tsp: usize,
+    warmup: usize,
+    samples: usize,
+    rng_in_timed: bool,
+    out: &mut BufWriter<File>,
+) -> std::io::Result<()> {
+    let scheme = "tspa";
+    let fx = tspa_proto::make_fixture(nsp, tsp);
+
+    let mut rng_reg = ChaCha20Rng::from_seed(seed_for(b"unified/tspa/reg_rng/v1", nsp, tsp));
+    let mut rng_auth = ChaCha20Rng::from_seed(seed_for(b"unified/tspa/auth_rng/v1", nsp, tsp));
+
+    
+    {
+        for _ in 0..warmup {
+            if rng_in_timed {
+                let t0 = Instant::now();
+                let it = tspa_proto::make_iter_data(&fx, &mut rng_reg);
+                let outv = tspa_proto::registration_user_side(&fx, &it);
+                black_box(outv);
+                black_box(t0.elapsed().as_nanos());
+            } else {
+                let it = tspa_proto::make_iter_data(&fx, &mut rng_reg);
+                let _ = tspa_proto::registration_user_side(&fx, &it);
+            }
+        }
+
+        let mut xs = Vec::with_capacity(samples);
+        for _ in 0..samples {
+            if rng_in_timed {
+                let t0 = Instant::now();
+                let it = tspa_proto::make_iter_data(&fx, &mut rng_reg);
+                let outv = tspa_proto::registration_user_side(&fx, &it);
+                black_box(outv);
+                xs.push(t0.elapsed().as_nanos());
+            } else {
+                let it = tspa_proto::make_iter_data(&fx, &mut rng_reg);
+                let t0 = Instant::now();
+                let outv = tspa_proto::registration_user_side(&fx, &it);
+                black_box(outv);
+                xs.push(t0.elapsed().as_nanos());
+            }
+        }
+        write_row(out, scheme, "proto", "reg", rng_in_timed, nsp, tsp, warmup, &compute_stats(xs))?;
+    }
+
+    
+    {
+        for _ in 0..warmup {
+            if rng_in_timed {
+                let t0 = Instant::now();
+                let it = tspa_proto::make_iter_data(&fx, &mut rng_auth);
+                let outv = tspa_proto::authentication_user_side(&fx, &it);
+                black_box(outv);
+                black_box(t0.elapsed().as_nanos());
+            } else {
+                let it = tspa_proto::make_iter_data(&fx, &mut rng_auth);
+                let _ = tspa_proto::authentication_user_side(&fx, &it);
+            }
+        }
+
+        let mut xs = Vec::with_capacity(samples);
+        for _ in 0..samples {
+            if rng_in_timed {
+                let t0 = Instant::now();
+                let it = tspa_proto::make_iter_data(&fx, &mut rng_auth);
+                let outv = tspa_proto::authentication_user_side(&fx, &it);
+                black_box(outv);
+                xs.push(t0.elapsed().as_nanos());
+            } else {
+                let it = tspa_proto::make_iter_data(&fx, &mut rng_auth);
+                let t0 = Instant::now();
+                let outv = tspa_proto::authentication_user_side(&fx, &it);
+                black_box(outv);
+                xs.push(t0.elapsed().as_nanos());
+            }
+        }
+
+        write_row(out, scheme, "proto", "auth", rng_in_timed, nsp, tsp, warmup, &compute_stats(xs))?;
+    }

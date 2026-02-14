@@ -1,11 +1,20 @@
-
-FROM rust:latest AS builder
+FROM rustlang/rust:nightly AS builder
 WORKDIR /app
 
+
 COPY Cargo.toml ./
+
+
+RUN mkdir -p src && echo "fn main(){}" > src/main.rs
+RUN cargo build --release --bins || true
+RUN rm -rf src
+
+
 COPY src ./src
 
+
 RUN cargo build --release --bins
+
 
 FROM debian:bookworm-slim
 
@@ -16,9 +25,8 @@ RUN apt-get update \
 COPY --from=builder /app/target/release/bench_upspa /usr/local/bin/bench_upspa
 COPY --from=builder /app/target/release/bench_tspa  /usr/local/bin/bench_tspa
 COPY --from=builder /app/target/release/bench_setup /usr/local/bin/bench_setup
-#   docker run IMAGE            -> runs UpSPA (default)
-#   docker run IMAGE tspa       -> runs TSPA
-#   docker run IMAGE setup      -> runs setup
+
+
 RUN printf '%s\n' \
   '#!/bin/sh' \
   'set -eu' \
@@ -37,8 +45,8 @@ RUN printf '%s\n' \
   > /usr/local/bin/run-bench \
   && chmod +x /usr/local/bin/run-bench
 
-WORKDIR /out
 
+WORKDIR /out
 
 ENTRYPOINT ["/usr/local/bin/run-bench"]
 CMD ["upspa"]

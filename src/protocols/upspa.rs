@@ -8,10 +8,10 @@ use curve25519_dalek::{ristretto::RistrettoPoint, scalar::Scalar};
 use ed25519_dalek::{Signer, SigningKey};
 use rand_chacha::ChaCha20Rng;
 use rand_core::{RngCore, SeedableRng};
-use std::hint::black_box; 
+use std::hint::black_box;
 
-pub const CIPHERID_PT_LEN: usize = 96; 
-pub const CIPHERSP_PT_LEN: usize = 40; 
+pub const CIPHERID_PT_LEN: usize = 96;
+pub const CIPHERSP_PT_LEN: usize = 40;
 
 #[derive(Clone)]
 pub struct Fixture {
@@ -23,7 +23,7 @@ pub struct Fixture {
     pub new_password: Vec<u8>,
     pub pwd_point: RistrettoPoint,
     pub shares: Vec<(u32, Scalar)>,
-    pub ids_for_t: Vec<u32>, 
+    pub ids_for_t: Vec<u32>,
     pub lagrange_at_zero: Vec<Scalar>,
     pub cipherid_aad: Vec<u8>,
     pub cipherid: CtBlob<CIPHERID_PT_LEN>,
@@ -109,7 +109,7 @@ pub fn make_fixture(nsp: usize, tsp: usize) -> Fixture {
         lsj,
         password,
         new_password,
-        pwd_point, 
+        pwd_point,
         shares,
         ids_for_t,
         lagrange_at_zero,
@@ -122,6 +122,7 @@ pub fn make_fixture(nsp: usize, tsp: usize) -> Fixture {
         cached_ctr: ctr,
     }
 }
+
 pub fn make_iter_data(fx: &Fixture, rng: &mut impl RngCore) -> IterData {
     let r = crypto::random_scalar(rng);
     let blinded = &fx.pwd_point * r;
@@ -184,7 +185,6 @@ pub fn registration_user_side(fx: &Fixture, it: &IterData) -> [u8; 32] {
     r
 }
 
-
 pub fn secret_update_user_side(fx: &Fixture, it: &IterData) -> [u8; 32] {
     // 1 decrypt for cid happens inside recover_state_user_side (t+1 total after we decrypt t cj below)
     let (rsp, fk, _sid) = recover_state_user_side(fx, it);
@@ -196,11 +196,15 @@ pub fn secret_update_user_side(fx: &Fixture, it: &IterData) -> [u8; 32] {
     }
     let mut old_ctr: u64 = 0;
     let mut old_rlsj = [0u8; 32];
-    for &id in fx.ids_for_t.iter() {
-        let blob = &fx.ciphersp_per_sp[(id - 1) as usize];
+    let m = (fx.nsp + fx.tsp - 1) / fx.tsp; // ceil(n/t)
+    for j in 0..m {
+        let id_usize = 1 + j * fx.tsp;
+        if id_usize > fx.nsp {
+        break;
+    }
+        let blob = &fx.ciphersp_per_sp[(id_usize - 1) as usize];
         let pt = crypto::xchacha_decrypt_detached(&fk, &fx.ciphersp_aad, blob)
             .expect("ciphersp must decrypt");
-
         let mut rlsj = [0u8; 32];
         rlsj.copy_from_slice(&pt[0..32]);
 
@@ -308,18 +312,32 @@ fn recover_state_user_side(fx: &Fixture, it: &IterData) -> ([u8; 32], [u8; 32], 
     (rsp, fk, sid)
 }
 
+
+///   AE-Dec count = ceil(n/t) + 1   (cipherid + ceil(n/t) ciphersp)
+///   Hash count   = (n + 1)         (n suid + 1 vinfo)
 pub fn authentication_user_side(fx: &Fixture, it: &IterData) -> [u8; 32] {
     let (rsp, fk, _sid) = recover_state_user_side(fx, it);
+    // m = ceil(n/t)
+    let m = (fx.nsp + fx.tsp - 1) / fx.tsp;
     let mut acc = blake3::Hasher::new();
-    acc.update(b"uptspa/authentication/acc/v4");
-    for &id in fx.ids_for_t.iter() {
-        let suid = crypto::hash_suid(&rsp, &fx.lsj, id);
+    acc.update(b"uptspa/authentication/acc/v5");
+
+    // (n) suid hashes
+    for i in 1..=fx.nsp {
+        let suid = crypto::hash_suid(&rsp, &fx.lsj, i as u32);
         acc.update(suid.as_ref());
     }
+
+    // decrypt only m ciphersp blobs (instead of t)
     let mut best_ctr: u64 = 0;
     let mut best_rlsj = [0u8; 32];
-    for &id in fx.ids_for_t.iter() {
-        let blob = &fx.ciphersp_per_sp[(id - 1) as usize];
+
+    for j in 0..m {
+        let id_usize = 1 + j * fx.tsp; 
+        if id_usize > fx.nsp {
+            break;
+        }
+        let blob = &fx.ciphersp_per_sp[id_usize - 1];
         let pt = crypto::xchacha_decrypt_detached(&fk, &fx.ciphersp_aad, blob)
             .expect("ciphersp must decrypt");
         let mut rlsj = [0u8; 32];
@@ -336,6 +354,7 @@ pub fn authentication_user_side(fx: &Fixture, it: &IterData) -> [u8; 32] {
     let vinfo_prime = crypto::hash_vinfo(&best_rlsj, &fx.lsj);
     acc.update(&best_ctr.to_le_bytes());
     acc.update(vinfo_prime.as_ref());
+
     let out = acc.finalize();
     let mut r = [0u8; 32];
     r.copy_from_slice(out.as_bytes());
@@ -386,7 +405,7 @@ pub fn setup_user_side_bench<R: RngCore + rand_core::CryptoRng>(
     let (master_sk, shares) = crypto::toprf_gen(nsp, tsp, rng);
     let sid: SigningKey = SigningKey::generate(rng);
     let sid_bytes = sid.to_bytes();
-    let sig_pk_bytes: [u8; 32] = sid.verifying_key().to_bytes(); 
+    let sig_pk_bytes: [u8; 32] = sid.verifying_key().to_bytes();
     let mut k0 = [0u8; 32];
     rng.fill_bytes(&mut k0);
     let y = &fx.pwd_point * master_sk;

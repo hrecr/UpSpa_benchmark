@@ -215,9 +215,11 @@ setup_upspa_setup.dat
 
 ## Running with Docker
 
-Docker builds the binaries once and runs them in a clean, reproducible environment.
+Docker builds all benchmarks once and runs them inside a clean, reproducible environment.
 
-### Build image
+---
+
+### Build the image
 
 ```bash
 docker build -t upspa-benchmark .
@@ -229,26 +231,30 @@ docker build -t upspa-benchmark .
 
 ```bash
 mkdir -p out
+
 docker run --rm \
   -v "$(pwd)/out:/out" \
   upspa-benchmark upspa \
   --nsp 20,40,60,80,100 \
-  --tsp-pct 20,40,60,80,100
+  --tsp-pct 20,40,60,80,100 \
+  --out-prefix /out/upspa
 ```
 
-Results appear in `./out/`.
+Results are written to `./out/`.
 
-
+---
 
 ### Run TSPA benchmark
 
 ```bash
 mkdir -p out
+
 docker run --rm \
   -v "$(pwd)/out:/out" \
   upspa-benchmark tspa \
   --nsp 20,40,60,80,100 \
-  --tsp-pct 20,40,60,80,100
+  --tsp-pct 20,40,60,80,100 \
+  --out-prefix /out/tspa
 ```
 
 ---
@@ -257,14 +263,19 @@ docker run --rm \
 
 ```bash
 mkdir -p out
+
 docker run --rm \
   -v "$(pwd)/out:/out" \
   upspa-benchmark setup \
   --nsp 20,40,60,80,100 \
-  --tsp-pct 20,40,60,80,100
+  --tsp-pct 20,40,60,80,100 \
+  --out-prefix /out/setup
 ```
 
 ---
+
+
+
 
 
 

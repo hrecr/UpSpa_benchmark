@@ -15,7 +15,7 @@ use ed25519_dalek::{Signer, SigningKey};
 use tspa::protocols::{tspa as tspa_proto, upspa as upspa_proto};
 use tspa::{crypto as up_crypto, crypto_tspa as tspa_crypto};
 
-
+// Fixed-nonce AEAD for "no RNG in timed region"
 use chacha20poly1305::{
     aead::{AeadInPlace, KeyInit},
     XChaCha20Poly1305, XNonce,
@@ -112,7 +112,8 @@ fn write_row(
     )
 }
 
-
+/// Fixed-nonce XChaCha20-Poly1305 encrypt for timing without RNG.
+/// Output layout matches up_crypto::CtBlob.
 fn upspa_aead_encrypt_fixed<const PT_LEN: usize>(
     key: &[u8; 32],
     aad: &[u8],
@@ -135,6 +136,7 @@ fn upspa_recover_state_and_cipherid_pt(
     fx: &upspa_proto::Fixture,
     it: &upspa_proto::IterData,
 ) -> ([u8; 32], [u8; upspa_proto::CIPHERID_PT_LEN]) {
+    // include "blind mul" parity (matches your protocol code)
     let b = &fx.pwd_point * it.r;
     black_box(b);
 
@@ -167,7 +169,8 @@ fn upspa_extract_rsp_fk_sid(
     (rsp, fk, sid)
 }
 
-
+/// Deterministically precompute the exact RNG outputs that your reg uses (rlsj then nonce),
+/// but do it OUTSIDE the timed region.
 fn upspa_precompute_reg_rng_outputs(r: Scalar) -> ([u8; 32], [u8; up_crypto::NONCE_LEN]) {
     let mut seed = r.to_bytes();
     seed[0] ^= 0xA5;
@@ -182,7 +185,7 @@ fn upspa_precompute_reg_rng_outputs(r: Scalar) -> ([u8; 32], [u8; up_crypto::NON
     (rlsj, nonce)
 }
 
-
+/// Same idea for secupd: (new_rlsj then nonce) outside timing.
 fn upspa_precompute_secu_rng_outputs(r: Scalar) -> ([u8; 32], [u8; up_crypto::NONCE_LEN]) {
     let mut seed = r.to_bytes();
     seed[0] ^= 0x3C;
@@ -197,7 +200,9 @@ fn upspa_precompute_secu_rng_outputs(r: Scalar) -> ([u8; 32], [u8; up_crypto::NO
     (new_rlsj, nonce)
 }
 
-
+/// Precompute pwdupd randomness outside timing:
+/// - coeffs (t scalars) for TOPRF polynomial
+/// - nonce for newcipherid
 fn upspa_precompute_pwdupd_coeffs_and_nonce(r: Scalar, tsp: usize) -> (Vec<Scalar>, [u8; up_crypto::NONCE_LEN]) {
     let mut seed = r.to_bytes();
     seed[0] ^= 0x77;
@@ -214,7 +219,7 @@ fn upspa_precompute_pwdupd_coeffs_and_nonce(r: Scalar, tsp: usize) -> (Vec<Scala
     (coeffs, nonce)
 }
 
-
+/// Match up_crypto::toprf_gen's evaluation method (power-basis eval).
 fn eval_poly_pow(coeffs: &[Scalar], x: Scalar) -> Scalar {
     let mut acc = Scalar::ZERO;
     let mut pow = Scalar::ONE;
@@ -225,7 +230,8 @@ fn eval_poly_pow(coeffs: &[Scalar], x: Scalar) -> Scalar {
     acc
 }
 
-
+/// UPSPA registration, but with RNG moved out of timed region.
+/// We still time TOPRF + cipherid dec + hashes + AEAD enc (but nonce/rlsj already chosen).
 fn upspa_registration_no_rng(
     fx: &upspa_proto::Fixture,
     it: &upspa_proto::IterData,
@@ -238,13 +244,13 @@ fn upspa_registration_no_rng(
     let mut acc = blake3::Hasher::new();
     acc.update(b"uptspa/registration/acc/v1");
 
-   
+    // (n) suid hashes
     for i in 1..=fx.nsp {
         let suid = up_crypto::hash_suid(&rsp, &fx.lsj, i as u32);
         acc.update(suid.as_ref());
     }
 
-    
+    // AEAD enc of ciphersp with fixed nonce (no RNG)
     let ctr: u64 = 0;
     let mut pt = [0u8; upspa_proto::CIPHERSP_PT_LEN];
     pt[0..32].copy_from_slice(&rlsj);
@@ -263,7 +269,8 @@ fn upspa_registration_no_rng(
     r
 }
 
-
+/// UPSPA secret update, RNG moved out of timed region.
+/// (new_rlsj + nonce precomputed; new_ctr still derived from decrypted old ctr inside timing)
 fn upspa_secu_no_rng(
     fx: &upspa_proto::Fixture,
     it: &upspa_proto::IterData,
@@ -276,13 +283,13 @@ fn upspa_secu_no_rng(
     let mut acc = blake3::Hasher::new();
     acc.update(b"uptspa/secret_update/acc/v3");
 
-    
+    // (n) suid hashes
     for i in 1..=fx.nsp {
         let suid = up_crypto::hash_suid(&rsp, &fx.lsj, i as u32);
         acc.update(suid.as_ref());
     }
 
-    
+    // decrypt t ciphersp (same as your protocol)
     let mut old_ctr: u64 = 0;
     let mut old_rlsj = [0u8; 32];
     for &id in fx.ids_for_t.iter() {
@@ -306,7 +313,7 @@ fn upspa_secu_no_rng(
 
     let new_ctr = old_ctr.wrapping_add(1);
 
-    
+    // AEAD enc with fixed nonce (no RNG)
     let mut pt = [0u8; upspa_proto::CIPHERSP_PT_LEN];
     pt[0..32].copy_from_slice(&new_rlsj);
     pt[32..40].copy_from_slice(&new_ctr.to_le_bytes());
@@ -328,24 +335,26 @@ fn upspa_secu_no_rng(
     r
 }
 
-
+/// UPSPA password update, RNG moved out of timed region:
+/// - coeff sampling + newcipherid nonce are precomputed outside timing
+/// - share evaluation (n * t field ops) stays in timed region
 fn upspa_pwdupd_no_rng(
     fx: &upspa_proto::Fixture,
     it: &upspa_proto::IterData,
     coeffs: &[Scalar],
     newcipherid_nonce: [u8; up_crypto::NONCE_LEN],
 ) -> [u8; 32] {
-    
+    // recover state + get cipherid_pt + sid (needed for signatures)
     let (_state_key, cipherid_pt) = upspa_recover_state_and_cipherid_pt(fx, it);
     let (_rsp, _fk, sid) = upspa_extract_rsp_fk_sid(&cipherid_pt);
 
     let mut acc = blake3::Hasher::new();
     acc.update(b"uptspa/password_update/acc/v1");
 
-    
+    // master key is a0
     let new_master_sk = coeffs[0];
 
-    
+    // evaluate shares inside timed region (keeps non-RNG cost)
     let mut new_shares: Vec<(u32, Scalar)> = Vec::with_capacity(fx.nsp);
     for i in 1..=fx.nsp {
         let x = Scalar::from(i as u64);
@@ -353,7 +362,7 @@ fn upspa_pwdupd_no_rng(
         new_shares.push((i as u32, s));
     }
 
-    
+    // build newcipherid (fixed nonce, no RNG)
     let p_new = up_crypto::hash_to_point(&fx.new_password);
     let y_new = p_new * new_master_sk;
     let new_state_key = up_crypto::oprf_finalize(&fx.new_password, &y_new);
@@ -402,7 +411,10 @@ fn upspa_pwdupd_no_rng(
     r
 }
 
-
+/// UPSPA auth formula-compatible:
+/// TOPRF + (ceil(n/t)+1) AE-Dec + (n+1) hash
+/// - hashes ALL n suid
+/// - decrypts ONLY m = ceil(n/t) ciphersp (plus cipherid)
 fn upspa_auth_formula_compatible(
     fx: &upspa_proto::Fixture,
     it: &upspa_proto::IterData,
@@ -413,13 +425,13 @@ fn upspa_auth_formula_compatible(
     let mut acc = blake3::Hasher::new();
     acc.update(b"uptspa/authentication/acc/formula_v1");
 
-    
+    // (n) suid hashes (NOT t)
     for i in 1..=fx.nsp {
         let suid = up_crypto::hash_suid(&rsp, &fx.lsj, i as u32);
         acc.update(suid.as_ref());
     }
 
-    
+    // decrypt m = ceil(n/t) ciphersp (NOT t)
     let m = (fx.nsp + fx.tsp - 1) / fx.tsp;
 
     let mut best_ctr: u64 = 0;
@@ -461,15 +473,15 @@ fn bench_upspa(
     let scheme = "upspa";
     let fx = upspa_proto::make_fixture(nsp, tsp);
 
-    
+    // RNGs for iter_data outside timed region
     let mut rng_reg = ChaCha20Rng::from_seed(seed_for(b"unified/upspa/reg_rng/v1", nsp, tsp));
     let mut rng_auth = ChaCha20Rng::from_seed(seed_for(b"unified/upspa/auth_rng/v1", nsp, tsp));
     let mut rng_sec = ChaCha20Rng::from_seed(seed_for(b"unified/upspa/sec_rng/v1", nsp, tsp));
     let mut rng_pwd = ChaCha20Rng::from_seed(seed_for(b"unified/upspa/pwd_rng/v1", nsp, tsp));
 
-    
+    // ---- PROTO reg ----
     {
-        
+        // warmup
         for _ in 0..warmup {
             let it = upspa_proto::make_iter_data(&fx, &mut rng_reg);
             let _ = if rng_in_timed {
@@ -485,7 +497,7 @@ fn bench_upspa(
             let it = upspa_proto::make_iter_data(&fx, &mut rng_reg);
 
             let (rlsj, nonce) = if rng_in_timed {
-                ([0u8; 32], [0u8; up_crypto::NONCE_LEN]) 
+                ([0u8; 32], [0u8; up_crypto::NONCE_LEN]) // unused
             } else {
                 upspa_precompute_reg_rng_outputs(it.r)
             };
@@ -502,7 +514,7 @@ fn bench_upspa(
         write_row(out, scheme, "proto", "reg", rng_in_timed, nsp, tsp, warmup, &compute_stats(xs))?;
     }
 
-    
+    // ---- PROTO auth (your existing function) ----
     {
         for _ in 0..warmup {
             let it = upspa_proto::make_iter_data(&fx, &mut rng_auth);
@@ -519,7 +531,7 @@ fn bench_upspa(
         write_row(out, scheme, "proto", "auth", rng_in_timed, nsp, tsp, warmup, &compute_stats(xs))?;
     }
 
-    
+    // ---- PROTO secupd ----
     {
         for _ in 0..warmup {
             let it = upspa_proto::make_iter_data(&fx, &mut rng_sec);
@@ -553,7 +565,7 @@ fn bench_upspa(
         write_row(out, scheme, "proto", "secupd", rng_in_timed, nsp, tsp, warmup, &compute_stats(xs))?;
     }
 
-    
+    // ---- PROTO pwdupd ----
     {
         for _ in 0..warmup {
             let it = upspa_proto::make_iter_data(&fx, &mut rng_pwd);
@@ -587,7 +599,7 @@ fn bench_upspa(
         write_row(out, scheme, "proto", "pwdupd", rng_in_timed, nsp, tsp, warmup, &compute_stats(xs))?;
     }
 
-    
+    // ---- FORMULA-COMPATIBLE auth (ceil(n/t)+1 AE-Dec, (n+1) hash) ----
     {
         for _ in 0..warmup {
             let it = upspa_proto::make_iter_data(&fx, &mut rng_auth);
@@ -603,9 +615,12 @@ fn bench_upspa(
         }
         write_row(out, scheme, "formula", "auth", rng_in_timed, nsp, tsp, warmup, &compute_stats(xs))?;
     }
+
+    // --------------------------
     // Primitives (UPSPA)
+    // --------------------------
     {
-        
+        // derive rsp/fk once (outside timing) for primitive benches that need them
         let mut rng0 = ChaCha20Rng::from_seed(seed_for(b"unified/upspa/prim/derive/v1", nsp, tsp));
         let it0 = upspa_proto::make_iter_data(&fx, &mut rng0);
         let (state_key0, cipherid_pt0) = upspa_recover_state_and_cipherid_pt(&fx, &it0);
@@ -769,10 +784,11 @@ fn bench_tspa(
     let mut rng_reg = ChaCha20Rng::from_seed(seed_for(b"unified/tspa/reg_rng/v1", nsp, tsp));
     let mut rng_auth = ChaCha20Rng::from_seed(seed_for(b"unified/tspa/auth_rng/v1", nsp, tsp));
 
-    
+    // ---- PROTO reg ----
     {
         for _ in 0..warmup {
             if rng_in_timed {
+                // includes iter_data generation inside timing (NOTE: includes extra work vs "core")
                 let t0 = Instant::now();
                 let it = tspa_proto::make_iter_data(&fx, &mut rng_reg);
                 let outv = tspa_proto::registration_user_side(&fx, &it);
@@ -803,7 +819,7 @@ fn bench_tspa(
         write_row(out, scheme, "proto", "reg", rng_in_timed, nsp, tsp, warmup, &compute_stats(xs))?;
     }
 
-    
+    // ---- PROTO auth ----
     {
         for _ in 0..warmup {
             if rng_in_timed {
@@ -837,3 +853,258 @@ fn bench_tspa(
 
         write_row(out, scheme, "proto", "auth", rng_in_timed, nsp, tsp, warmup, &compute_stats(xs))?;
     }
+
+    // --------------------------
+    // Primitives (TSPA)
+    // --------------------------
+    {
+        let mut rng = ChaCha20Rng::from_seed(seed_for(b"unified/tspa/prim/rng/v1", nsp, tsp));
+
+        let k = tspa_crypto::random_scalar(&mut rng);
+        let y = fx.pwd_point * k;
+
+        let rnd32 = tspa_crypto::rand_bytes::<32>(&mut rng);
+        let key = tspa_crypto::oprf_finalize(&fx.password, &y);
+        let iv = tspa_crypto::rand_bytes::<16>(&mut rng);
+        let block = tspa_crypto::rand_bytes::<32>(&mut rng);
+
+        let a = tspa_crypto::random_scalar(&mut rng);
+        let b = tspa_crypto::random_scalar(&mut rng);
+        let c = tspa_crypto::random_scalar(&mut rng);
+
+        // HASH storuid
+        {
+            for _ in 0..warmup {
+                let h = tspa_crypto::hash_storuid(&fx.uid, &fx.lsj);
+                black_box(h);
+            }
+            let mut xs = Vec::with_capacity(samples);
+            for _ in 0..samples {
+                let t0 = Instant::now();
+                let h = tspa_crypto::hash_storuid(&fx.uid, &fx.lsj);
+                black_box(h);
+                xs.push(t0.elapsed().as_nanos());
+            }
+            write_row(out, scheme, "prim", "HASH_storuid", rng_in_timed, nsp, tsp, warmup, &compute_stats(xs))?;
+        }
+
+        // HASH vinfo
+        {
+            for _ in 0..warmup {
+                let h = tspa_crypto::hash_vinfo(&rnd32, &fx.lsj);
+                black_box(h);
+            }
+            let mut xs = Vec::with_capacity(samples);
+            for _ in 0..samples {
+                let t0 = Instant::now();
+                let h = tspa_crypto::hash_vinfo(&rnd32, &fx.lsj);
+                black_box(h);
+                xs.push(t0.elapsed().as_nanos());
+            }
+            write_row(out, scheme, "prim", "HASH_vinfo", rng_in_timed, nsp, tsp, warmup, &compute_stats(xs))?;
+        }
+
+        // OPRF finalize (hash-only)
+        {
+            for _ in 0..warmup {
+                let outk = tspa_crypto::oprf_finalize(&fx.password, &y);
+                black_box(outk);
+            }
+            let mut xs = Vec::with_capacity(samples);
+            for _ in 0..samples {
+                let t0 = Instant::now();
+                let outk = tspa_crypto::oprf_finalize(&fx.password, &y);
+                black_box(outk);
+                xs.push(t0.elapsed().as_nanos());
+            }
+            write_row(out, scheme, "prim", "OPRF_finalize", rng_in_timed, nsp, tsp, warmup, &compute_stats(xs))?;
+        }
+
+        // OPRF full eval = MulP + finalize (matches what your TSPA reg does per provider)
+        {
+            for _ in 0..warmup {
+                let y2 = fx.pwd_point * k;
+                black_box(y2.compress());
+                let outk = tspa_crypto::oprf_finalize(&fx.password, &y2);
+                black_box(outk);
+            }
+            let mut xs = Vec::with_capacity(samples);
+            for _ in 0..samples {
+                let t0 = Instant::now();
+                let y2 = fx.pwd_point * k;
+                black_box(y2.compress());
+                let outk = tspa_crypto::oprf_finalize(&fx.password, &y2);
+                black_box(outk);
+                xs.push(t0.elapsed().as_nanos());
+            }
+            write_row(out, scheme, "prim", "OPRF_eval_full", rng_in_timed, nsp, tsp, warmup, &compute_stats(xs))?;
+        }
+
+        // MulP
+        {
+            for _ in 0..warmup {
+                let p = fx.pwd_point * k;
+                black_box(p.compress());
+            }
+            let mut xs = Vec::with_capacity(samples);
+            for _ in 0..samples {
+                let t0 = Instant::now();
+                let p = fx.pwd_point * k;
+                black_box(p.compress());
+                xs.push(t0.elapsed().as_nanos());
+            }
+            write_row(out, scheme, "prim", "MulP_point_scalar", rng_in_timed, nsp, tsp, warmup, &compute_stats(xs))?;
+        }
+
+        // InvS
+        {
+            for _ in 0..warmup {
+                let inv = k.invert();
+                black_box(inv);
+            }
+            let mut xs = Vec::with_capacity(samples);
+            for _ in 0..samples {
+                let t0 = Instant::now();
+                let inv = k.invert();
+                black_box(inv);
+                xs.push(t0.elapsed().as_nanos());
+            }
+            write_row(out, scheme, "prim", "InvS_scalar_invert", rng_in_timed, nsp, tsp, warmup, &compute_stats(xs))?;
+        }
+
+        // FieldOp (mul+add)
+        {
+            for _ in 0..warmup {
+                let r = a * b + c;
+                black_box(r);
+            }
+            let mut xs = Vec::with_capacity(samples);
+            for _ in 0..samples {
+                let t0 = Instant::now();
+                let r = a * b + c;
+                black_box(r);
+                xs.push(t0.elapsed().as_nanos());
+            }
+            write_row(out, scheme, "prim", "FieldOp_mul_add", rng_in_timed, nsp, tsp, warmup, &compute_stats(xs))?;
+        }
+
+        // AES-256-CTR XOR 32
+        {
+            for _ in 0..warmup {
+                let ct = tspa_crypto::aes256ctr_xor_32(key, iv, block);
+                black_box(ct);
+            }
+            let mut xs = Vec::with_capacity(samples);
+            for _ in 0..samples {
+                let t0 = Instant::now();
+                let ct = tspa_crypto::aes256ctr_xor_32(key, iv, block);
+                black_box(ct);
+                xs.push(t0.elapsed().as_nanos());
+            }
+            write_row(out, scheme, "prim", "AES256CTR_xor_32", rng_in_timed, nsp, tsp, warmup, &compute_stats(xs))?;
+        }
+
+        // PolyEval (degree t-1)
+        {
+            let mut coeffs = Vec::with_capacity(tsp);
+            coeffs.push(tspa_crypto::random_scalar(&mut rng));
+            for _ in 1..tsp {
+                coeffs.push(tspa_crypto::random_scalar(&mut rng));
+            }
+            let x = Scalar::from(1u64);
+
+            for _ in 0..warmup {
+                let s = tspa_crypto::eval_poly(&coeffs, x);
+                black_box(s);
+            }
+            let mut xs = Vec::with_capacity(samples);
+            for _ in 0..samples {
+                let t0 = Instant::now();
+                let s = tspa_crypto::eval_poly(&coeffs, x);
+                black_box(s);
+                xs.push(t0.elapsed().as_nanos());
+            }
+            write_row(out, scheme, "prim", "PolyEval_degree_t_minus_1", rng_in_timed, nsp, tsp, warmup, &compute_stats(xs))?;
+        }
+    }
+
+    Ok(())
+}
+
+fn main() -> std::io::Result<()> {
+    // Defaults
+    let mut scheme: String = "all".to_string(); // all | upspa | tspa
+
+    let mut nsp_list: Vec<usize> = vec![20, 40, 60, 80, 100];
+    let mut tsp_abs: Option<Vec<usize>> = None;
+    let mut tsp_pct: Option<Vec<u32>> = Some(vec![20, 40, 60, 80, 100]);
+
+    let mut sample_size: usize = 2000;
+    let mut warmup_iters: usize = 300;
+    let mut out_path: String = "unified_bench.dat".to_string();
+
+    // RNG in timed region?
+    let mut rng_in_timed: bool = false;
+
+    // CLI
+    let mut args = std::env::args().skip(1);
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--scheme" => scheme = args.next().expect("missing --scheme value"),
+            "--nsp" => nsp_list = parse_list_usize(&args.next().expect("missing --nsp value")),
+            "--tsp" => {
+                tsp_abs = Some(parse_list_usize(&args.next().expect("missing --tsp value")));
+                tsp_pct = None;
+            }
+            "--tsp-pct" => {
+                tsp_pct = Some(parse_list_u32(&args.next().expect("missing --tsp-pct value")));
+                tsp_abs = None;
+            }
+            "--sample-size" => sample_size = args.next().expect("missing --sample-size").parse().unwrap(),
+            "--warmup-iters" => warmup_iters = args.next().expect("missing --warmup-iters").parse().unwrap(),
+            "--out" => out_path = args.next().expect("missing --out"),
+            "--rng-in-timed" | "--rng" => rng_in_timed = true,
+            "--bench" => { let _ = args.next(); } // tolerate cargo/libtest noise
+            _ if a.starts_with('-') => {}
+            _ => {}
+        }
+    }
+
+    let file = File::create(out_path)?;
+    let mut out = BufWriter::new(file);
+    write_header(&mut out)?;
+
+    // Build points (nsp, tsp)
+    let mut points: Vec<(usize, usize)> = Vec::new();
+    for &nsp in &nsp_list {
+        if let Some(ts) = &tsp_abs {
+            for &t in ts {
+                if (1..=nsp).contains(&t) {
+                    points.push((nsp, t));
+                }
+            }
+        } else if let Some(pcts) = &tsp_pct {
+            for &pct in pcts {
+                let mut t = (nsp * pct as usize) / 100;
+                if t < 1 { t = 1; }
+                if t > nsp { t = nsp; }
+                points.push((nsp, t));
+            }
+        }
+    }
+
+    for (nsp, tsp) in points {
+        if scheme == "all" || scheme == "upspa" {
+            bench_upspa(nsp, tsp, warmup_iters, sample_size, rng_in_timed, &mut out)?;
+            out.flush()?;
+        }
+        if scheme == "all" || scheme == "tspa" {
+            bench_tspa(nsp, tsp, warmup_iters, sample_size, rng_in_timed, &mut out)?;
+            out.flush()?;
+        }
+
+        eprintln!("done nsp={nsp} tsp={tsp} scheme={scheme} rng_in_timed={rng_in_timed}");
+    }
+
+    Ok(())
+}

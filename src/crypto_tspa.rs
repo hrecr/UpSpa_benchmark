@@ -1,6 +1,6 @@
 use aes::Aes256;
 use blake3;
-use ctr::cipher::KeyIvInit, StreamCipher;
+use ctr::cipher::{KeyIvInit, StreamCipher};
 use ctr::Ctr128BE;
 use curve25519_dalek::{ristretto::RistrettoPoint, scalar::Scalar};
 use rand_core::RngCore;

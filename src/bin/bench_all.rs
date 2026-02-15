@@ -1006,7 +1006,7 @@ fn bench_tspa(
         {
             for _ in 0..warmup {
                 let y2 = fx.pwd_point * k;
-                black_box(y2.compress());
+                // black_box(y2.compress());
                 let outk = tspa_crypto::oprf_finalize(&fx.password, &y2);
                 black_box(outk);
             }
@@ -1014,7 +1014,7 @@ fn bench_tspa(
             for _ in 0..samples {
                 let t0 = Instant::now();
                 let y2 = fx.pwd_point * k;
-                black_box(y2.compress());
+                // black_box(y2.compress());
                 let outk = tspa_crypto::oprf_finalize(&fx.password, &y2);
                 black_box(outk);
                 xs.push(t0.elapsed().as_nanos());
@@ -1026,13 +1026,13 @@ fn bench_tspa(
         {
             for _ in 0..warmup {
                 let p = fx.pwd_point * k;
-                black_box(p.compress());
+                // black_box(p.compress());
             }
             let mut xs = Vec::with_capacity(samples);
             for _ in 0..samples {
                 let t0 = Instant::now();
                 let p = fx.pwd_point * k;
-                black_box(p.compress());
+                // black_box(p.compress());
                 xs.push(t0.elapsed().as_nanos());
             }
             write_row(out, scheme, "prim", "MulP_point_scalar", rng_in_timed, nsp, tsp, warmup, &compute_stats(xs))?;

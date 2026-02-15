@@ -47,72 +47,75 @@ For **TSPA**, we instantiate a non-threshold OPRF over `ristretto255` and protec
 
 For **UpSPA**, we instantiate a threshold OPRF over `ristretto255` and protect client state and per-server records using **XChaCha20-Poly1305** authenticated encryption. Authenticated updates during password changes use **Ed25519** digital signatures.
 
----
+You’re mixing **two different README versions**:
+
+* Your README text assumes **3 binaries** (`bench_upspa`, `bench_tspa`, `bench_setup`) and `--out-prefix`.
+* Your actual code you pasted earlier is a **single unified binary** (`bench_all.rs`) that uses `--scheme ... --out ...` (and optionally `--rng` / `--profile`).
+
+So the README must be updated to match **bench_all.rs**. Below is a clean, paste-ready update that keeps your style, adds the formulas section, and fixes the “run locally / Docker” sections.
+
+Copy-paste this block to replace your README from Repository layout down to the end.
+
+
 ## Repository layout
+
 ```
 UpSpa_benchmark/
 ├── Cargo.toml
 ├── README.md
 ├── Dockerfile.yml
 └── src/
-    ├── lib.rs
-    ├── crypto.rs
-    ├── protocols/
-    │   ├── upspa.rs
-    │   └── tspa.rs
-    └── bin/
-        ├── bench_upspa.rs
-        ├── bench_tspa.rs
-        └── bench_setup.rs
+├── lib.rs
+├── crypto.rs
+├── protocols/
+│   ├── upspa.rs
+│   └── tspa.rs
+└── bin/
+└── bench_all.rs
+
 ```
 
-Each file under `src/bin/` is a **standalone CLI benchmark binary**.
+`src/bin/bench_all.rs` is a **single CLI benchmark binary** that can run **UpSPA**, **TSPA**, or **both**, and writes a single output `.dat` file.
 
 ---
 
 ## Output files
 
-Each benchmark writes one or more `.dat` files to disk.
+`bench_all` writes **one** `.dat` file (default: `unified_bench.dat`, or whatever you set via `--out`).
 
-### UpSPA
-
-Produces:
-
-* `upspa_reg.dat`
-* `upspa_auth.dat`
-* `upspa_secupd.dat`
-* `upspa_pwdupd.dat`
-
-### TSPA
-
-Produces:
-
-* `tspa_reg.dat`
-* `tspa_auth.dat`
-
-### Setup
-
-Produces:
-
-* `upspa_setup.dat`
-
-All output files are plain text with whitespace-separated columns.
-
-Typical header formats:
-
-**UpSPA / TSPA**
+The output is plain text with whitespace-separated columns:
 
 ```
-nsp tsp samples warmup min_ns p50_ns p95_ns max_ns mean_ns stddev_ns
-```
 
-**Setup**
+scheme kind op rng_in_timed nsp tsp samples warmup min_ns p50_ns p95_ns max_ns mean_ns stddev_ns
 
-```
-nsp tsp_label t_abs samples warmup min_ns p50_ns p95_ns max_ns mean_ns stddev_ns
-```
+````
 
 All times are reported in **nanoseconds**.
+
+- `scheme ∈ {upspa, tspa}`
+- `kind ∈ {proto, prim, bucket}` (bucket rows exist only if `--profile` is enabled)
+- `op` is the operation name (e.g., `reg`, `auth`, `TOPRF_recv_eval_tsp`, `OPRF_recv_eval_tsp`, ...)
+
+---
+
+## Exact cost formulas (client-side)
+
+This section summarizes the **client-side computation** that each benchmarked phase performs, expressed as a **count of primitive operations**.
+
+Notation:
+
+- `n = nsp` (number of storage providers)
+- `t = tsp` (threshold)
+- `H_*` = one BLAKE3-based hash invocation of the indicated kind
+- `AEAD_DEC_cid` = XChaCha20-Poly1305 decrypt of `cipherid` (96B)
+- `AEAD_ENC_sp` / `AEAD_DEC_sp` = XChaCha20-Poly1305 encrypt/decrypt of a `ciphersp` (40B)
+- `AES_XOR_32` = AES-256-CTR XOR on 32 bytes
+- `MulP` = Ristretto point-scalar multiplication
+- `InvS` = scalar inversion
+- `PolyEval(t-1)` = Shamir polynomial evaluation of degree `t-1` (Horner)
+- `FieldMulAdd` = scalar ops used in interpolation (`acc += share * lambda`)
+
 
 ---
 
@@ -127,157 +130,132 @@ All times are reported in **nanoseconds**.
 
 ```bash
 cargo build --release
-```
+````
 
 ---
 
 ## CLI usage (important)
 
-All benchmarks support the **same CLI interface**.
-
-### Common flags
+`bench_all` supports the following flags:
 
 | Flag             | Meaning                                   |
 | ---------------- | ----------------------------------------- |
+| `--scheme`       | `all` | `upspa` | `tspa`                  |
 | `--nsp`          | Comma-separated list of number of servers |
 | `--tsp`          | Absolute threshold list                   |
 | `--tsp-pct`      | Threshold as percentage of `nsp`          |
 | `--sample-size`  | Number of measured samples                |
-| `--warmup-iters` | Warmup iterations (UpSPA/TSPA)            |
-| `--warmup-ms`    | Warmup time in ms (Setup only)            |
-| `--out-prefix`   | Prefix for output files                   |
+| `--warmup-iters` | Warmup iterations                         |
+| `--out`          | Output `.dat` path                        |
+| `--rng-in-timed` | Include RNG in timed region (optional)    |
+| `--profile`      | Emit extra `kind=bucket` rows (optional)  |
 | `--bench`        | Ignored (Cargo/Windows noise)             |
 
 You must choose **either** `--tsp` **or** `--tsp-pct`.
 
 ---
 
-### UpSPA benchmark
+### Run both schemes (UpSPA + TSPA)
 
 ```bash
-cargo run --release --bin bench_upspa -- \
+cargo run --release --bin bench_all -- \
+  --scheme all \
   --nsp 20,40,60,80,100 \
   --tsp-pct 20,40,60,80,100 \
   --warmup-iters 300 \
   --sample-size 2000 \
-  --out-prefix upspa
+  --out unified_bench.dat
 ```
 
-Writes:
-
-```
-upspa_reg.dat
-upspa_auth.dat
-upspa_secupd.dat
-upspa_pwdupd.dat
-```
-
----
-
-### TSPA benchmark
+### Run only UpSPA
 
 ```bash
-cargo run --release --bin bench_tspa -- \
+cargo run --release --bin bench_all -- \
+  --scheme upspa \
   --nsp 20,40,60,80,100 \
   --tsp-pct 20,40,60,80,100 \
   --warmup-iters 300 \
   --sample-size 2000 \
-  --out-prefix tspa
+  --out upspa_only.dat
 ```
 
-Writes:
-
-```
-tspa_reg.dat
-tspa_auth.dat
-```
-
----
-
-### Setup benchmark
+### Run only TSPA
 
 ```bash
-cargo run --release --bin bench_setup -- \
+cargo run --release --bin bench_all -- \
+  --scheme tspa \
   --nsp 20,40,60,80,100 \
   --tsp-pct 20,40,60,80,100 \
-  --warmup-ms 2000 \
-  --sample-size 100 \
-  --out-prefix setup
+  --warmup-iters 300 \
+  --sample-size 2000 \
+  --out tspa_only.dat
 ```
 
-Writes:
+### Optional: enable bucket profiling
 
-```
-setup_upspa_setup.dat
+```bash
+cargo run --release --bin bench_all -- \
+  --scheme all \
+  --nsp 20,40,60,80,100 \
+  --tsp-pct 20,40,60,80,100 \
+  --warmup-iters 300 \
+  --sample-size 2000 \
+  --profile \
+  --out unified_bench_profiled.dat
 ```
 
 ---
 
 ## Running with Docker
 
-Docker builds all benchmarks once and runs them inside a clean, reproducible environment.
-
----
+Docker builds the benchmarks once and runs them inside a clean environment.
 
 ### Build the image
 
-```bash
-docker build -t upspa-benchmark .
-```
-
----
-
-### Run UpSPA benchmark
+Your repo uses `Dockerfile.yml`, so build with `-f`:
 
 ```bash
-mkdir -p out
-
-docker run --rm \
-  -v "$(pwd)/out:/out" \
-  upspa-benchmark upspa \
-  --nsp 20,40,60,80,100 \
-  --tsp-pct 20,40,60,80,100 \
-  --out-prefix /out/upspa
+docker build -f Dockerfile.yml -t upspa-benchmark .
 ```
 
-Results are written to `./out/`.
-
----
-
-### Run TSPA benchmark
+### Run bench_all inside Docker
 
 ```bash
 mkdir -p out
 
 docker run --rm \
   -v "$(pwd)/out:/out" \
-  upspa-benchmark tspa \
-  --nsp 20,40,60,80,100 \
-  --tsp-pct 20,40,60,80,100 \
-  --out-prefix /out/tspa
+  upspa-benchmark \
+  cargo run --release --bin bench_all -- \
+    --scheme all \
+    --nsp 20,40,60,80,100 \
+    --tsp-pct 20,40,60,80,100 \
+    --warmup-iters 300 \
+    --sample-size 2000 \
+    --out /out/unified_bench.dat
 ```
 
----
+Results are written to `./out/unified_bench.dat`.
 
-### Run Setup benchmark
+### Run with profiling inside Docker (optional)
 
 ```bash
 mkdir -p out
 
 docker run --rm \
   -v "$(pwd)/out:/out" \
-  upspa-benchmark setup \
-  --nsp 20,40,60,80,100 \
-  --tsp-pct 20,40,60,80,100 \
-  --out-prefix /out/setup
+  upspa-benchmark \
+  cargo run --release --bin bench_all -- \
+    --scheme all \
+    --nsp 20,40,60,80,100 \
+    --tsp-pct 20,40,60,80,100 \
+    --warmup-iters 300 \
+    --sample-size 2000 \
+    --profile \
+    --out /out/unified_bench_profiled.dat
 ```
 
 ---
-
-
-
-
-
 
 
 

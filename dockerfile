@@ -1,20 +1,19 @@
 FROM rustlang/rust:nightly AS builder
 WORKDIR /app
 
-
+# Copy manifests first for better layer caching
 COPY Cargo.toml ./
 
-
+# Dummy build to cache dependencies
 RUN mkdir -p src && echo "fn main(){}" > src/main.rs
 RUN cargo build --release --bins || true
 RUN rm -rf src
 
-
+# Copy actual sources
 COPY src ./src
 
-
+# Build release binaries (includes bench_all)
 RUN cargo build --release --bins
-
 
 FROM debian:bookworm-slim
 
@@ -22,31 +21,10 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /app/target/release/bench_upspa /usr/local/bin/bench_upspa
-COPY --from=builder /app/target/release/bench_tspa  /usr/local/bin/bench_tspa
-COPY --from=builder /app/target/release/bench_setup /usr/local/bin/bench_setup
-
-
-RUN printf '%s\n' \
-  '#!/bin/sh' \
-  'set -eu' \
-  'cmd="${1:-upspa}"' \
-  'shift || true' \
-  'case "$cmd" in' \
-  '  upspa)  exec /usr/local/bin/bench_upspa "$@" ;;' \
-  '  tspa)   exec /usr/local/bin/bench_tspa "$@" ;;' \
-  '  setup)  exec /usr/local/bin/bench_setup "$@" ;;' \
-  '  *)' \
-  '    echo "Unknown benchmark: $cmd" >&2' \
-  '    echo "Use one of: upspa | tspa | setup" >&2' \
-  '    exit 2' \
-  '  ;;' \
-  'esac' \
-  > /usr/local/bin/run-bench \
-  && chmod +x /usr/local/bin/run-bench
-
+# Copy the single benchmark binary
+COPY --from=builder /app/target/release/bench_all /usr/local/bin/bench_all
 
 WORKDIR /out
 
-ENTRYPOINT ["/usr/local/bin/run-bench"]
-CMD ["upspa"]
+# Run bench_all directly; pass flags after the image name
+ENTRYPOINT ["/usr/local/bin/bench_all"]

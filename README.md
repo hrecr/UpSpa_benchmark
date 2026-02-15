@@ -116,6 +116,47 @@ Notation:
 - `PolyEval(t-1)` = Shamir polynomial evaluation of degree `t-1` (Horner)
 - `FieldMulAdd` = scalar ops used in interpolation (`acc += share * lambda`)
 
+### TSPA
+
+#### Registration (client-side)
+
+Reg_TSPA = H_storuid + H_vinfo
+
+* n · [ (MulP + H_oprf_finalize) + PolyEval(t−1) + AES_XOR_32 ]
+
+#### Authentication (client-side)
+
+Auth_TSPA = H_storuid
+
+* MulP + InvS
+* t · [ (MulP + H_oprf_finalize) + AES_XOR_32 + FieldMulAdd ]
+* H_vinfo
+
+---
+
+### UpSPA
+
+#### Registration (client-side)
+
+Reg_UpSPA = TOPRF_recv(t) + AEAD_DEC_cid
+
+* n · H_suid
+* AEAD_ENC_sp
+* H_vinfo
+
+#### Authentication (client-side)
+
+This repository’s **bench_all** uses the strict **2-decrypt authentication** variant:
+
+* decrypt `cipherid` once (AEAD_DEC_cid)
+* decrypt **one** `ciphersp` once (1 × AEAD_DEC_sp)
+* still computes `t` SUid hashes for contacted providers
+
+Auth_UpSPA^(2dec) = TOPRF_recv(t) + AEAD_DEC_cid
+
+* t · H_suid
+* 1 · AEAD_DEC_sp
+* H_vinfo
 
 ---
 

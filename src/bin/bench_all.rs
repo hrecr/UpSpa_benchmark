@@ -1,25 +1,21 @@
 #![allow(clippy::needless_range_loop)]
 
-// Standard library imports for file I/O and timing measurements
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::time::Instant;
 
-// Cryptographic primitives
-use blake3; // BLAKE3 hashing
-use rand_chacha::ChaCha20Rng; // ChaCha20 random number generator
-use rand_core::{RngCore, SeedableRng}; // RNG trait and seeding
-use std::hint::black_box; // Prevent compiler optimizations during timing
+use blake3;
+use rand_chacha::ChaCha20Rng;
+use rand_core::{RngCore, SeedableRng};
+use std::hint::black_box;
 
-// Elliptic curve cryptography
 use curve25519_dalek::{ristretto::RistrettoPoint, scalar::Scalar};
-use ed25519_dalek::{Signer, SigningKey}; // Digital signatures
+use ed25519_dalek::{Signer, SigningKey};
 
-// Protocol implementations (UPSPA and TSPA)
 use tspa::protocols::{tspa as tspa_proto, upspa as upspa_proto};
 use tspa::{crypto as up_crypto, crypto_tspa as tspa_crypto};
 
-// AEAD encryption (fixed-nonce variant for timing measurements without RNG in critical path)
+// AEAD encryption (fixed-nonce variant to avoid RNG in critical path)
 use chacha20poly1305::{
     aead::{AeadInPlace, KeyInit},
     XChaCha20Poly1305, XNonce,
@@ -41,19 +37,16 @@ struct Stats {
 /// Computes statistical measures from a vector of timing samples (in nanoseconds)
 /// Returns min, median, p95, max, mean, and standard deviation
 fn compute_stats(mut xs: Vec<u128>) -> Stats {
-    // Sort samples to compute percentiles
     xs.sort_unstable();
     let n = xs.len();
-    let min_ns = xs[0]; // Minimum value
-    let max_ns = xs[n - 1]; // Maximum value
-    let p50_ns = xs[n / 2]; // Median (50th percentile)
-    let p95_ns = xs[(n * 95) / 100]; // 95th percentile
+    let min_ns = xs[0];
+    let max_ns = xs[n - 1];
+    let p50_ns = xs[n / 2];
+    let p95_ns = xs[(n * 95) / 100];
 
-    // Compute mean
     let sum: f64 = xs.iter().map(|&x| x as f64).sum();
     let mean_ns = sum / (n as f64);
 
-    // Compute sample standard deviation
     let mut var = 0.0;
     for &x in &xs {
         let d = (x as f64) - mean_ns;
@@ -234,34 +227,14 @@ fn upspa_precompute_secu_rng_outputs(r: Scalar) -> ([u8; 32], [u8; up_crypto::NO
 }
 
 /// Precompute password update RNG outputs OUTSIDE the timed region
-fn upspa_precompute_pwdupd_coeffs_and_nonce(
-    r: Scalar,
-    tsp: usize,
-) -> (Vec<Scalar>, [u8; up_crypto::NONCE_LEN]) {
+fn upspa_precompute_pwdupd_nonce(r: Scalar) -> [u8; up_crypto::NONCE_LEN] {
     let mut seed = r.to_bytes();
     seed[0] ^= 0x77;
     let mut rng = ChaCha20Rng::from_seed(seed);
 
-    let mut coeffs = Vec::with_capacity(tsp);
-    for _ in 0..tsp {
-        coeffs.push(up_crypto::random_scalar(&mut rng));
-    }
-
     let mut nonce = [0u8; up_crypto::NONCE_LEN];
     rng.fill_bytes(&mut nonce);
-
-    (coeffs, nonce)
-}
-
-/// Evaluate polynomial using power basis
-fn eval_poly_pow(coeffs: &[Scalar], x: Scalar) -> Scalar {
-    let mut acc = Scalar::ZERO;
-    let mut pow = Scalar::ONE;
-    for c in coeffs {
-        acc += c * pow;
-        pow *= x;
-    }
-    acc
+    nonce
 }
 
 /// Perform UPSPA registration with RNG precomputed outside timed region
@@ -367,64 +340,53 @@ fn upspa_secu_no_rng(
 fn upspa_pwdupd_no_rng(
     fx: &upspa_proto::Fixture,
     it: &upspa_proto::IterData,
-    coeffs: &[Scalar],
     newcipherid_nonce: [u8; up_crypto::NONCE_LEN],
 ) -> [u8; 32] {
+    // First TOPRF round + decrypt of current cipherid.
     let (_state_key, cipherid_pt) = upspa_recover_state_and_cipherid_pt(fx, it);
     let (_rsp, _fk, sid) = upspa_extract_rsp_fk_sid(&cipherid_pt);
 
-    let mut acc = blake3::Hasher::new();
-    acc.update(b"uptspa/password_update/acc/v1");
+    // Second TOPRF round (NEW password) — server partials are precomputed in IterData.
+    let b_new = &fx.new_pwd_point * it.r_new;
+    black_box(b_new);
 
-    let new_master_sk = coeffs[0];
+    let new_state_key = up_crypto::toprf_client_eval_from_partials(
+        &fx.new_password,
+        it.r_new,
+        &it.partials_new,
+        &fx.lagrange_at_zero,
+    );
 
-    let mut new_shares: Vec<(u32, Scalar)> = Vec::with_capacity(fx.nsp);
-    for i in 1..=fx.nsp {
-        let x = Scalar::from(i as u64);
-        let s = eval_poly_pow(coeffs, x);
-        new_shares.push((i as u32, s));
-    }
-
-    let p_new = up_crypto::hash_to_point(&fx.new_password);
-    let y_new = p_new * new_master_sk;
-    let new_state_key = up_crypto::oprf_finalize(&fx.new_password, &y_new);
-    let newcipherid =
+    // Re-encrypt the SAME plaintext under the new password-derived key.
+    let cid_new =
         upspa_aead_encrypt_fixed(&new_state_key, &fx.cipherid_aad, &cipherid_pt, newcipherid_nonce);
 
+    // One signature (no per-provider index).
     let timestamp: u64 = 0;
-    const MSG_LEN: usize = 24 + 96 + 16 + 32 + 8 + 4;
+    const MSG_LEN: usize = 24 + 96 + 16 + 8; // nonce || ct || tag || time
+    let mut msg = [0u8; MSG_LEN];
+    let mut off = 0;
+    msg[off..off + 24].copy_from_slice(&cid_new.nonce);
+    off += 24;
+    msg[off..off + 96].copy_from_slice(&cid_new.ct);
+    off += 96;
+    msg[off..off + 16].copy_from_slice(&cid_new.tag);
+    off += 16;
+    msg[off..off + 8].copy_from_slice(&timestamp.to_le_bytes());
+    off += 8;
+    debug_assert_eq!(off, MSG_LEN);
 
-    for (id, share) in new_shares.iter() {
-        let i_u32 = *id;
-        let share_bytes = share.to_bytes();
+    let sig = sid.sign(&msg);
+    let sig_bytes = sig.to_bytes();
 
-        let mut msg = [0u8; MSG_LEN];
-        let mut off = 0;
-        msg[off..off + 24].copy_from_slice(&newcipherid.nonce);
-        off += 24;
-        msg[off..off + 96].copy_from_slice(&newcipherid.ct);
-        off += 96;
-        msg[off..off + 16].copy_from_slice(&newcipherid.tag);
-        off += 16;
-        msg[off..off + 32].copy_from_slice(&share_bytes);
-        off += 32;
-        msg[off..off + 8].copy_from_slice(&timestamp.to_le_bytes());
-        off += 8;
-        msg[off..off + 4].copy_from_slice(&i_u32.to_le_bytes());
-        off += 4;
-
-        debug_assert_eq!(off, MSG_LEN);
-
-        let sig = sid.sign(&msg);
-        let sig_bytes = sig.to_bytes();
-
-        acc.update(&i_u32.to_le_bytes());
-        acc.update(&sig_bytes);
-    }
-
-    acc.update(&newcipherid.nonce);
-    acc.update(&newcipherid.ct);
-    acc.update(&newcipherid.tag);
+    // Benchmark-only accumulator.
+    let mut acc = blake3::Hasher::new();
+    acc.update(b"uptspa/password_update/acc/v2");
+    acc.update(&sig_bytes);
+    acc.update(&cid_new.nonce);
+    acc.update(&cid_new.ct);
+    acc.update(&cid_new.tag);
+    acc.update(&timestamp.to_le_bytes());
 
     let out = acc.finalize();
     let mut r = [0u8; 32];
@@ -433,11 +395,11 @@ fn upspa_pwdupd_no_rng(
 }
 
 //
-// ====================
+/
 // UPDATED UPSPA AUTH FOR YOUR REQUEST: EXACTLY 2 DECRYPTIONS
 //   - 1 decrypt cipherid (inside upspa_recover_state_and_cipherid_pt)
 //   - 1 decrypt ciphersp (only one provider)
-// ====================
+// 
 //
 fn upspa_auth_two_decryptions(
     fx: &upspa_proto::Fixture,
@@ -496,7 +458,7 @@ fn bench_upspa(
     let mut rng_sec = ChaCha20Rng::from_seed(seed_for(b"unified/upspa/sec_rng/v1", nsp, tsp));
     let mut rng_pwd = ChaCha20Rng::from_seed(seed_for(b"unified/upspa/pwd_rng/v1", nsp, tsp));
 
-    // ---- PROTO reg ----
+    // Registration
     {
         for _ in 0..warmup {
             let it = upspa_proto::make_iter_data(&fx, &mut rng_reg);
@@ -540,9 +502,7 @@ fn bench_upspa(
         )?;
     }
 
-    // ====================
-    // PROTOCOL AUTHENTICATION (UPDATED: EXACT 2 DECRYPTIONS)
-    // ====================
+    // Authentication (2 decryptions: cipherid + ciphersp)
     {
         for _ in 0..warmup {
             let it = upspa_proto::make_iter_data(&fx, &mut rng_auth);
@@ -569,9 +529,7 @@ fn bench_upspa(
         )?;
     }
 
-    // ====================
-    // PROTOCOL SECRET UPDATE
-    // ====================
+    // Secret update
     {
         for _ in 0..warmup {
             let it = upspa_proto::make_iter_data(&fx, &mut rng_sec);
@@ -615,17 +573,15 @@ fn bench_upspa(
         )?;
     }
 
-    // ====================
-    // PROTOCOL PASSWORD UPDATE
-    // ====================
+    // Password update
     {
         for _ in 0..warmup {
             let it = upspa_proto::make_iter_data(&fx, &mut rng_pwd);
             let _ = if rng_in_timed {
                 upspa_proto::password_update_user_side(&fx, &it)
             } else {
-                let (coeffs, nonce) = upspa_precompute_pwdupd_coeffs_and_nonce(it.r, fx.tsp);
-                upspa_pwdupd_no_rng(&fx, &it, &coeffs, nonce)
+                let nonce = upspa_precompute_pwdupd_nonce(it.r);
+                upspa_pwdupd_no_rng(&fx, &it, nonce)
             };
         }
 
@@ -633,17 +589,17 @@ fn bench_upspa(
         for _ in 0..samples {
             let it = upspa_proto::make_iter_data(&fx, &mut rng_pwd);
 
-            let (coeffs, nonce) = if rng_in_timed {
-                (Vec::new(), [0u8; up_crypto::NONCE_LEN])
+            let nonce = if rng_in_timed {
+                [0u8; up_crypto::NONCE_LEN]
             } else {
-                upspa_precompute_pwdupd_coeffs_and_nonce(it.r, fx.tsp)
+                upspa_precompute_pwdupd_nonce(it.r)
             };
 
             let t0 = Instant::now();
             let outv = if rng_in_timed {
                 upspa_proto::password_update_user_side(&fx, &it)
             } else {
-                upspa_pwdupd_no_rng(&fx, &it, &coeffs, nonce)
+                upspa_pwdupd_no_rng(&fx, &it, nonce)
             };
             black_box(outv);
             xs.push(t0.elapsed().as_nanos());
@@ -661,17 +617,16 @@ fn bench_upspa(
         )?;
     }
 
-    // ====================
+
+
     // CRYPTOGRAPHIC PRIMITIVES
-    // ====================
     {
-        // Pre-derive rsp/fk ONCE (outside timing) for primitive benchmarks that need them
         let mut rng0 = ChaCha20Rng::from_seed(seed_for(b"unified/upspa/prim/derive/v1", nsp, tsp));
         let it0 = upspa_proto::make_iter_data(&fx, &mut rng0);
         let (state_key0, cipherid_pt0) = upspa_recover_state_and_cipherid_pt(&fx, &it0);
         let (rsp0, fk0, _sid0) = upspa_extract_rsp_fk_sid(&cipherid_pt0);
 
-        // TOPRF receiver-side evaluation (client): blind mul + combine partials + unblind + finalize
+        // TOPRF receiver-side evaluation
         {
             let mut rng = ChaCha20Rng::from_seed(seed_for(b"unified/upspa/prim/toprf/v1", nsp, tsp));
             for _ in 0..warmup {
@@ -715,7 +670,7 @@ fn bench_upspa(
             )?;
         }
 
-        // AEAD Decryption of cipherid
+        // AEAD decrypt cipherid
         {
             for _ in 0..warmup {
                 let pt =
@@ -745,7 +700,7 @@ fn bench_upspa(
             )?;
         }
 
-        // AEAD Decryption of a single ciphersp
+        // AEAD decrypt ciphersp
         {
             let one = &fx.ciphersp_per_sp[0];
             for _ in 0..warmup {
@@ -772,7 +727,7 @@ fn bench_upspa(
             )?;
         }
 
-        // AEAD Encryption of ciphersp (RNG handling depends on rng_in_timed flag)
+        // AEAD encrypt ciphersp
         {
             let ctr: u64 = 0;
             let mut pt = [0u8; upspa_proto::CIPHERSP_PT_LEN];
@@ -835,7 +790,7 @@ fn bench_upspa(
             }
         }
 
-        // Hash Generation for suid
+        // Hash suid
         {
             for _ in 0..warmup {
                 let h = up_crypto::hash_suid(&rsp0, &fx.lsj, 1);
@@ -861,7 +816,7 @@ fn bench_upspa(
             )?;
         }
 
-        // Hash Generation for vinfo
+        // Hash vinfo
         {
             for _ in 0..warmup {
                 let h = up_crypto::hash_vinfo(&fx.cached_rlsj, &fx.lsj);
@@ -906,9 +861,7 @@ fn bench_tspa(
     let mut rng_reg = ChaCha20Rng::from_seed(seed_for(b"unified/tspa/reg_rng/v1", nsp, tsp));
     let mut rng_auth = ChaCha20Rng::from_seed(seed_for(b"unified/tspa/auth_rng/v1", nsp, tsp));
 
-    // ====================
-    // PROTOCOL REGISTRATION
-    // ====================
+    // Registration
     {
         for _ in 0..warmup {
             if rng_in_timed {
@@ -952,9 +905,7 @@ fn bench_tspa(
         )?;
     }
 
-    // ====================
-    // PROTOCOL AUTHENTICATION
-    // ====================
+    // Authentication
     {
         for _ in 0..warmup {
             if rng_in_timed {
@@ -999,9 +950,9 @@ fn bench_tspa(
         )?;
     }
 
-    // ====================
+
     // CRYPTOGRAPHIC PRIMITIVES
-    // ====================
+  
     {
         let mut rng = ChaCha20Rng::from_seed(seed_for(b"unified/tspa/prim/rng/v1", nsp, tsp));
 
@@ -1017,7 +968,7 @@ fn bench_tspa(
         let b = tspa_crypto::random_scalar(&mut rng);
         let c = tspa_crypto::random_scalar(&mut rng);
 
-        // ==== HASH storuid ====
+        // Hash storuid
         {
             for _ in 0..warmup {
                 let h = tspa_crypto::hash_storuid(&fx.uid, &fx.lsj);
@@ -1043,7 +994,7 @@ fn bench_tspa(
             )?;
         }
 
-        // ==== HASH vinfo ====
+        // Hash vinfo
         {
             for _ in 0..warmup {
                 let h = tspa_crypto::hash_vinfo(&rnd32, &fx.lsj);
@@ -1069,7 +1020,7 @@ fn bench_tspa(
             )?;
         }
 
-        // ==== OPRF finalize ====
+        // OPRF finalize
         {
             for _ in 0..warmup {
                 let outk = tspa_crypto::oprf_finalize(&fx.password, &y);
@@ -1095,7 +1046,7 @@ fn bench_tspa(
             )?;
         }
 
-        // ==== OPRF full evaluation (MulP + finalize) ====
+        // OPRF evaluation (MulP + finalize)
         {
             for _ in 0..warmup {
                 let y2 = fx.pwd_point * k;
@@ -1123,11 +1074,7 @@ fn bench_tspa(
             )?;
         }
 
-        // ============================
-        // NEW: OPRF receiver-side eval for tsp providers (FAIR vs TOPRF)
-        // - simulate server replies outside timing
-        // - time only client: blind mul + invert + tsp*(unblind mul + finalize)
-        // ============================
+        // OPRF receiver-side evaluation for tsp providers
         {
             let mut rng2 =
                 ChaCha20Rng::from_seed(seed_for(b"unified/tspa/prim/oprf_recv_tsp/v1", nsp, tsp));
@@ -1194,7 +1141,7 @@ fn bench_tspa(
             )?;
         }
 
-        // ==== MulP ====
+        // MulP (point-scalar multiplication)
         {
             for _ in 0..warmup {
                 let p = fx.pwd_point * k;
@@ -1220,7 +1167,7 @@ fn bench_tspa(
             )?;
         }
 
-        // ==== InvS ====
+        // InvS (scalar inversion)
         {
             for _ in 0..warmup {
                 let inv = k.invert();
@@ -1246,7 +1193,7 @@ fn bench_tspa(
             )?;
         }
 
-        // ==== Field op (mul+add) ====
+        // Field operation (mul+add)
         {
             for _ in 0..warmup {
                 let r = a * b + c;
@@ -1272,7 +1219,7 @@ fn bench_tspa(
             )?;
         }
 
-        // ==== AES-CTR XOR 32B ====
+        // AES-CTR XOR 32 bytes
         {
             for _ in 0..warmup {
                 let ct = tspa_crypto::aes256ctr_xor_32(key, iv, block);
@@ -1298,7 +1245,7 @@ fn bench_tspa(
             )?;
         }
 
-        // ==== PolyEval degree t-1 ====
+        // Polynomial evaluation (degree t-1)
         {
             let mut coeffs = Vec::with_capacity(tsp);
             coeffs.push(tspa_crypto::random_scalar(&mut rng));
@@ -1337,17 +1284,15 @@ fn bench_tspa(
 
 /// Main entry point for benchmark suite
 fn main() -> std::io::Result<()> {
-    // ===== DEFAULT CONFIGURATION =====
-    let mut scheme: String = "all".to_string(); // all | upspa | tspa
-
+    // Default configuration
+    let mut scheme: String = "all".to_string();
     let mut nsp_list: Vec<usize> = vec![20, 40, 60, 80, 100];
     let mut tsp_abs: Option<Vec<usize>> = None;
     let mut tsp_pct: Option<Vec<u32>> = Some(vec![20, 40, 60, 80, 100]);
 
     let mut sample_size: usize = 2000;
     let mut warmup_iters: usize = 300;
-    let mut out_path: String = "unified_bench.dat".to_string();
-
+    let mut out_path: String = "full_bench.dat".to_string();
     let mut rng_in_timed: bool = false;
 
     // ===== COMMAND-LINE PARSING =====
@@ -1380,12 +1325,9 @@ fn main() -> std::io::Result<()> {
         }
     }
 
-    // ===== OUTPUT FILE SETUP =====
     let file = File::create(out_path)?;
     let mut out = BufWriter::new(file);
     write_header(&mut out)?;
-
-    // ===== BUILD (n,t) BENCHMARK POINTS =====
     let mut points: Vec<(usize, usize)> = Vec::new();
     for &nsp in &nsp_list {
         if let Some(ts) = &tsp_abs {

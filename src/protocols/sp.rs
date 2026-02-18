@@ -2,6 +2,7 @@ use crate::crypto;
 use crate::crypto_tspa;
 use crate::protocols::tspa as tspa_proto;
 use crate::protocols::upspa as upspa_proto;
+
 use curve25519_dalek::ristretto::{CompressedRistretto, RistrettoPoint};
 use curve25519_dalek::scalar::Scalar;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
@@ -44,21 +45,12 @@ pub const NET_UPSPA_PUT_CSP_RESP_BYTES: usize = 1;
 /// UpSPA password update request total size (uid_hash + msg + sig).
 /// msg layout: cipherid_blob || share || timestamp || idx
 pub const NET_UPSPA_PWDUPD_REQ_BYTES: usize = 32
-    + (crypto::NONCE_LEN
-        + upspa_proto::CIPHERID_PT_LEN
-        + crypto::TAG_LEN
-        + 32
-        + 8
-        + 4)
+    + (crypto::NONCE_LEN + upspa_proto::CIPHERID_PT_LEN + crypto::TAG_LEN + 8)
     + 64;
 /// 1-byte status response for password update.
 pub const NET_UPSPA_PWDUPD_RESP_BYTES: usize = 1;
 
-/// Minimal in-memory UpSPA storage provider used by benchmarks.
-///
-/// Note: this is a simple, not thread-safe model intended for testing and
-/// benchmarking. It stores the provider's TOPRF share, a signing key used
-/// for password-update verification, and an in-memory map of stored ciphertexts.
+
 #[derive(Clone)]
 pub struct UpSpaProvider {
     pub sp_id: u32,
@@ -68,8 +60,7 @@ pub struct UpSpaProvider {
     pub sig_pk: VerifyingKey,
     /// Per-login-server records keyed by `SUid`.
     pub ciphersp_db: HashMap<[u8; 32], crypto::CtBlob<{ upspa_proto::CIPHERSP_PT_LEN }>>,
-    /// Optional cached latest cipherid blob (not strictly required for the scheme,
-    /// but convenient for benchmarking an "apply update" write path).
+    /// Cached latest cipherid blob (benchmark-friendly write path).
     pub last_cipherid: crypto::CtBlob<{ upspa_proto::CIPHERID_PT_LEN }>,
     /// Monotonic timestamp guard for password updates.
     pub last_pwdupd_ts: u64,
@@ -113,37 +104,30 @@ impl UpSpaProvider {
     }
 
     #[inline]
-    pub fn put_ciphersp(&mut self, suid: [u8; 32], blob: crypto::CtBlob<{ upspa_proto::CIPHERSP_PT_LEN }>) {
-        // Replace existing entry (benchmark-friendly: avoids map growth).
+    pub fn put_ciphersp(
+        &mut self,
+        suid: [u8; 32],
+        blob: crypto::CtBlob<{ upspa_proto::CIPHERSP_PT_LEN }>,
+    ) {
         self.ciphersp_db.insert(suid, blob);
     }
 
-    /// Verify and apply a password update payload.
-    ///
-    ///
-    /// Expected `msg` layout (client benchmark):
-    ///   cipherid_blob (nonce||ct||tag) || share (32) || timestamp (8) || idx (4)
-    ///
-    /// The function performs lightweight validation in this order:
-    /// 1. quick length check, 2. monotonic timestamp check, 3. signature verify,
-    /// then parses and applies the new cipherid and TOPRF share.
-    /// Returns `true` on success.
+    
     #[inline]
     pub fn apply_password_update(&mut self, msg: &[u8], sig: &Signature) -> bool {
-        // Fast reject on timestamp (assumes msg is well-formed).
-        const MIN_MSG: usize = crypto::NONCE_LEN
-            + upspa_proto::CIPHERID_PT_LEN
-            + crypto::TAG_LEN
-            + 32
-            + 8
-            + 4;
+        const MIN_MSG: usize =
+            crypto::NONCE_LEN + upspa_proto::CIPHERID_PT_LEN + crypto::TAG_LEN + 8;
         if msg.len() < MIN_MSG {
             return false;
         }
-        let ts_off = crypto::NONCE_LEN + upspa_proto::CIPHERID_PT_LEN + crypto::TAG_LEN + 32;
+
+        // Timestamp is the last 8 bytes of msg.
+        let ts_off = crypto::NONCE_LEN + upspa_proto::CIPHERID_PT_LEN + crypto::TAG_LEN;
         let mut ts_bytes = [0u8; 8];
         ts_bytes.copy_from_slice(&msg[ts_off..ts_off + 8]);
         let ts = u64::from_le_bytes(ts_bytes);
+
+        // Monotonic timestamp guard.
         if ts < self.last_pwdupd_ts {
             return false;
         }
@@ -153,17 +137,20 @@ impl UpSpaProvider {
             return false;
         }
 
-        // Parse and apply: update cached cipherid and provider share.
-        // Parse cipherid blob (nonce || ct || tag)
+        // Parse and apply cipherid blob (nonce || ct || tag)
         let mut nonce = [0u8; crypto::NONCE_LEN];
         nonce.copy_from_slice(&msg[0..crypto::NONCE_LEN]);
+
         let mut ct = [0u8; upspa_proto::CIPHERID_PT_LEN];
         ct.copy_from_slice(&msg[crypto::NONCE_LEN..crypto::NONCE_LEN + upspa_proto::CIPHERID_PT_LEN]);
+
         let mut tag = [0u8; crypto::TAG_LEN];
         tag.copy_from_slice(
             &msg[crypto::NONCE_LEN + upspa_proto::CIPHERID_PT_LEN
                 ..crypto::NONCE_LEN + upspa_proto::CIPHERID_PT_LEN + crypto::TAG_LEN],
         );
+
+    
         self.last_cipherid = crypto::CtBlob { nonce, ct, tag };
 
         // share bytes (32) follow the cipherid blob + tag
@@ -177,7 +164,7 @@ impl UpSpaProvider {
     }
 }
 
-/// Minimal in-memory TSPA provider storing an OPRF key and ciphertext records.
+
 #[derive(Clone)]
 pub struct TspaProvider {
     pub sp_id: u32,
@@ -189,7 +176,11 @@ pub struct TspaProvider {
 
 impl TspaProvider {
     pub fn new(sp_id: u32, oprf_key: Scalar) -> Self {
-        Self { sp_id, oprf_key, record_db: HashMap::new() }
+        Self {
+            sp_id,
+            oprf_key,
+            record_db: HashMap::new(),
+        }
     }
 
     /// OPRF sender evaluation: given `blinded = H(pwd) * r` (compressed), return
@@ -222,10 +213,6 @@ pub fn compress_point(p: &RistrettoPoint) -> [u8; 32] {
     p.compress().to_bytes()
 }
 
-/// Derive a fixed-size uid hash used in network payloads.
-///
-/// In a real deployment this should be a domain-separated hash of the user id
-/// and any context/salt. Here it is used for deterministic benchmarking.
 #[inline]
 pub fn uid_hash(uid: &[u8]) -> [u8; 32] {
     let mut h = blake3::Hasher::new();

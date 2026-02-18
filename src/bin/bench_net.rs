@@ -170,3 +170,58 @@ fn add_signed_ns(base: u64, delta: i64) -> u64 {
         base.saturating_sub((-delta) as u64)
     }
 }
+
+// Simulates a single parallel phase where the client fans out to `k` providers.
+//-------------------------------------------------------------------------------
+// Model behavior:
+// 1. Client queues `k` requests on shared uplink (each request transmission takes req_tx ns)
+// 2. Each request travels across the network with propagation latency and jitter
+// 3. Provider processes request (adds proc_ns) and sends response
+// 4. Response travels back across the network with propagation latency and jitter
+// 5. Client receives responses on shared downlink, queuing them in order
+//-------------------------------------------------------------------------------
+// Returns: Total time from first request sent to last response received
+fn simulate_parallel_phase(
+    k: usize,
+    req_payload_bytes: usize,
+    resp_payload_bytes: usize,
+    proc_ns: u64,
+    prof: NetProfile,
+    rng: &mut ChaCha20Rng,
+) -> u64 {
+    if k == 0 {
+        return 0;
+    }
+
+    let req_bytes = req_payload_bytes + prof.overhead_bytes;
+    let resp_bytes = resp_payload_bytes + prof.overhead_bytes;
+
+    let req_tx = tx_time_ns(req_bytes, prof.bw_bps);
+    let resp_tx = tx_time_ns(resp_bytes, prof.bw_bps);
+    let resp_rx = tx_time_ns(resp_bytes, prof.bw_bps);
+
+    // Uplink queue + per-provider pipeline.
+    let mut send_end = 0u64;
+    let mut resp_arrivals: Vec<u64> = Vec::with_capacity(k);
+
+    for _ in 0..k {
+        send_end = send_end.saturating_add(req_tx);
+        let j_req = sample_jitter(rng, prof.jitter_ns);
+        let t_arrive_provider = add_signed_ns(send_end.saturating_add(prof.one_way_ns), j_req);
+
+        let t_ready = t_arrive_provider.saturating_add(proc_ns);
+        let j_resp = sample_jitter(rng, prof.jitter_ns);
+        let t_arrive_client = add_signed_ns(t_ready.saturating_add(resp_tx).saturating_add(prof.one_way_ns), j_resp);
+        resp_arrivals.push(t_arrive_client);
+    }
+
+    // Downlink queue.
+    resp_arrivals.sort_unstable();
+    let mut down_end = 0u64;
+    for t in resp_arrivals {
+        let start = down_end.max(t);
+        down_end = start.saturating_add(resp_rx);
+    }
+
+    down_end
+}

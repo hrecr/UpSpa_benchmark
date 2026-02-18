@@ -74,3 +74,105 @@ pub struct UpSpaProvider {
     /// Monotonic timestamp guard for password updates.
     pub last_pwdupd_ts: u64,
 }
+
+impl UpSpaProvider {
+    pub fn new(
+        sp_id: u32,
+        share: Scalar,
+        sig_pk_bytes: [u8; 32],
+        initial_cipherid: crypto::CtBlob<{ upspa_proto::CIPHERID_PT_LEN }>,
+    ) -> Self {
+        let sig_pk = VerifyingKey::from_bytes(&sig_pk_bytes).expect("valid verifying key bytes");
+        Self {
+            sp_id,
+            share,
+            sig_pk,
+            ciphersp_db: HashMap::new(),
+            last_cipherid: initial_cipherid,
+            last_pwdupd_ts: 0,
+        }
+    }
+
+    /// TOPRF sender evaluation: given `blinded = H(pwd) * r` (compressed), return
+    /// `partial = blinded * k_i` (compressed).
+    #[inline]
+    pub fn toprf_send_eval(&self, blinded_bytes: &[u8; 32]) -> [u8; 32] {
+        let blinded = CompressedRistretto(*blinded_bytes)
+            .decompress()
+            .expect("valid compressed Ristretto");
+        let y = blinded * self.share;
+        y.compress().to_bytes()
+    }
+
+    #[inline]
+    pub fn get_ciphersp(
+        &self,
+        suid: &[u8; 32],
+    ) -> Option<crypto::CtBlob<{ upspa_proto::CIPHERSP_PT_LEN }>> {
+        self.ciphersp_db.get(suid).cloned()
+    }
+
+    #[inline]
+    pub fn put_ciphersp(&mut self, suid: [u8; 32], blob: crypto::CtBlob<{ upspa_proto::CIPHERSP_PT_LEN }>) {
+        // Replace existing entry (benchmark-friendly: avoids map growth).
+        self.ciphersp_db.insert(suid, blob);
+    }
+
+    /// Verify and apply a password update payload.
+    ///
+    ///
+    /// Expected `msg` layout (client benchmark):
+    ///   cipherid_blob (nonce||ct||tag) || share (32) || timestamp (8) || idx (4)
+    ///
+    /// The function performs lightweight validation in this order:
+    /// 1. quick length check, 2. monotonic timestamp check, 3. signature verify,
+    /// then parses and applies the new cipherid and TOPRF share.
+    /// Returns `true` on success.
+    #[inline]
+    pub fn apply_password_update(&mut self, msg: &[u8], sig: &Signature) -> bool {
+        // Fast reject on timestamp (assumes msg is well-formed).
+        const MIN_MSG: usize = crypto::NONCE_LEN
+            + upspa_proto::CIPHERID_PT_LEN
+            + crypto::TAG_LEN
+            + 32
+            + 8
+            + 4;
+        if msg.len() < MIN_MSG {
+            return false;
+        }
+        let ts_off = crypto::NONCE_LEN + upspa_proto::CIPHERID_PT_LEN + crypto::TAG_LEN + 32;
+        let mut ts_bytes = [0u8; 8];
+        ts_bytes.copy_from_slice(&msg[ts_off..ts_off + 8]);
+        let ts = u64::from_le_bytes(ts_bytes);
+        if ts < self.last_pwdupd_ts {
+            return false;
+        }
+
+        if self.sig_pk.verify(msg, sig).is_err() {
+            // Signature mismatch: reject update.
+            return false;
+        }
+
+        // Parse and apply: update cached cipherid and provider share.
+        // Parse cipherid blob (nonce || ct || tag)
+        let mut nonce = [0u8; crypto::NONCE_LEN];
+        nonce.copy_from_slice(&msg[0..crypto::NONCE_LEN]);
+        let mut ct = [0u8; upspa_proto::CIPHERID_PT_LEN];
+        ct.copy_from_slice(&msg[crypto::NONCE_LEN..crypto::NONCE_LEN + upspa_proto::CIPHERID_PT_LEN]);
+        let mut tag = [0u8; crypto::TAG_LEN];
+        tag.copy_from_slice(
+            &msg[crypto::NONCE_LEN + upspa_proto::CIPHERID_PT_LEN
+                ..crypto::NONCE_LEN + upspa_proto::CIPHERID_PT_LEN + crypto::TAG_LEN],
+        );
+        self.last_cipherid = crypto::CtBlob { nonce, ct, tag };
+
+        // share bytes (32) follow the cipherid blob + tag
+        let share_off = crypto::NONCE_LEN + upspa_proto::CIPHERID_PT_LEN + crypto::TAG_LEN;
+        let mut share_bytes = [0u8; 32];
+        share_bytes.copy_from_slice(&msg[share_off..share_off + 32]);
+        self.share = Scalar::from_bytes_mod_order(share_bytes);
+
+        self.last_pwdupd_ts = ts;
+        true
+    }
+}

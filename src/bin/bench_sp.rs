@@ -106,3 +106,112 @@ fn write_row(
         st.stddev_ns
     )
 }
+
+// UpSPA: helpers for fixture extraction
+
+
+fn upspa_recover_cipherid_pt_and_sid_rsp_fk(
+    fx: &upspa_proto::Fixture,
+) -> ([u8; upspa_proto::CIPHERID_PT_LEN], SigningKey, [u8; 32], [u8; 32]) {
+    // Deterministic r for recovery.
+    let seed = seed_for(b"bench_sp/upspa/recover/v1", fx.nsp, fx.tsp);
+    let mut rng = ChaCha20Rng::from_seed(seed);
+    let r = up_crypto::random_scalar(&mut rng);
+    let blinded = fx.pwd_point * r;
+
+    let mut partials = Vec::with_capacity(fx.tsp);
+    for id in 1..=fx.tsp {
+        let share = fx.shares[id - 1].1;
+        partials.push(blinded * share);
+    }
+
+    let state_key = up_crypto::toprf_client_eval_from_partials(
+        &fx.password,
+        r,
+        &partials,
+        &fx.lagrange_at_zero,
+    );
+    let pt = up_crypto::xchacha_decrypt_detached(&state_key, &fx.cipherid_aad, &fx.cipherid)
+        .expect("cipherid must decrypt");
+
+    let mut sid_bytes = [0u8; 32];
+    sid_bytes.copy_from_slice(&pt[0..32]);
+    let sid = SigningKey::from_bytes(&sid_bytes);
+
+    let mut rsp = [0u8; 32];
+    rsp.copy_from_slice(&pt[32..64]);
+    let mut fk = [0u8; 32];
+    fk.copy_from_slice(&pt[64..96]);
+
+    (pt, sid, rsp, fk)
+}
+
+fn build_upspa_providers(
+    fx: &upspa_proto::Fixture,
+    rsp: &[u8; 32],
+) -> Vec<sp_mod::UpSpaProvider> {
+    let mut providers = Vec::with_capacity(fx.nsp);
+    for i in 1..=fx.nsp {
+        let share = fx.shares[i - 1].1;
+        let mut sp = sp_mod::UpSpaProvider::new(i as u32, share, fx.sig_pk_bytes, fx.cipherid.clone());
+        let suid = up_crypto::hash_suid(rsp, &fx.lsj, i as u32);
+        sp.put_ciphersp(suid, fx.ciphersp_per_sp[i - 1].clone());
+        providers.push(sp);
+    }
+    providers
+}
+
+fn build_upspa_pwdupd_payloads(
+    fx: &upspa_proto::Fixture,
+    cipherid_pt: &[u8; upspa_proto::CIPHERID_PT_LEN],
+    sid: &SigningKey,
+) -> (Vec<Vec<u8>>, Vec<Signature>) {
+    // Deterministic RNG for password update generation.
+    let seed = seed_for(b"bench_sp/upspa/pwdupd/gen/v1", fx.nsp, fx.tsp);
+    let mut rng = ChaCha20Rng::from_seed(seed);
+    let mut rng2 = ChaCha20Rng::from_seed(seed);
+
+    // Generate new TOPRF shares.
+    let (_new_master_sk, new_shares) = up_crypto::toprf_gen(fx.nsp, fx.tsp, &mut rng2);
+
+    // Encrypt a new cipherid under the new password.
+    let p_new = up_crypto::hash_to_point(&fx.new_password);
+    let y_new = p_new * _new_master_sk;
+    let new_state_key: [u8; 32] = up_crypto::oprf_finalize(&fx.new_password, &y_new);
+    let new_cipherid = up_crypto::xchacha_encrypt_detached(&new_state_key, &fx.cipherid_aad, cipherid_pt, &mut rng2);
+
+    let timestamp: u64 = 0;
+    const MSG_LEN: usize = 24 + 96 + 16 + 32 + 8 + 4;
+
+    let mut msgs = Vec::with_capacity(fx.nsp);
+    let mut sigs = Vec::with_capacity(fx.nsp);
+
+    for (id, share) in new_shares.iter() {
+        let i_u32 = *id;
+        let share_bytes = share.to_bytes();
+        let mut msg = vec![0u8; MSG_LEN];
+        let mut off = 0;
+        msg[off..off + 24].copy_from_slice(&new_cipherid.nonce);
+        off += 24;
+        msg[off..off + 96].copy_from_slice(&new_cipherid.ct);
+        off += 96;
+        msg[off..off + 16].copy_from_slice(&new_cipherid.tag);
+        off += 16;
+        msg[off..off + 32].copy_from_slice(&share_bytes);
+        off += 32;
+        msg[off..off + 8].copy_from_slice(&timestamp.to_le_bytes());
+        off += 8;
+        msg[off..off + 4].copy_from_slice(&i_u32.to_le_bytes());
+        off += 4;
+        debug_assert_eq!(off, MSG_LEN);
+
+        // Sign exactly the same message layout as the client-side benchmark.
+        let sig = sid.sign(&msg);
+        msgs.push(msg);
+        sigs.push(sig);
+    }
+
+    // Consume rng so the compiler can't see it as unused.
+    black_box(rng.next_u64());
+    (msgs, sigs)
+}

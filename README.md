@@ -126,3 +126,216 @@ Select with `--pwdupd`:
 
 
 ---
+
+## Network model (LAN/WAN)
+
+The simulator models a “fan-out” phase:
+- client sends `k` requests (serialized on the uplink),
+- each provider “processes” for `proc_ns` (injected),
+- providers respond, and responses are serialized on the downlink.
+
+For each message:
+- **propagation delay**: `one_way_ns = (rtt_ms / 2)`
+- **jitter**: sampled uniformly in `[-jitter_ns, +jitter_ns]` independently per direction
+- **bandwidth serialization**:
+  - `tx_ns = ceil(bits * 1e9 / bw_bps)`
+  - the simulator adds `overhead_bytes` to both req/resp sizes before computing `tx_ns`
+
+Default profiles (can be overridden by flags):
+- **LAN**: RTT=0.5ms, jitter=0.05ms, bandwidth=1000 Mbps, overhead=64 bytes
+- **WAN**: RTT=60ms, jitter=5ms, bandwidth=50 Mbps, overhead=64 bytes
+
+### Phase message patterns (high level)
+
+**UpSPA:**
+- `setup`: `nsp` parallel messages
+- `reg`: TOPRF to `tsp` + PUT to `nsp`
+- `auth`: TOPRF to `tsp` + GET to `m = ceil(nsp / tsp)`
+- `secupd`: TOPRF to `tsp` + GET to `m` + PUT to `nsp`
+- `pwdupd`: TOPRF to `tsp` + password-update to `nsp`
+  - v2 uses a smaller request payload size than v1 (see `upspa_pwdupd_req_bytes()` in the bench)
+
+**TSPA:**
+- `setup`: modeled as server init only (no client↔provider messages)
+- `reg`: `nsp` parallel messages
+- `auth`: `tsp` parallel messages
+
+Message sizes are taken from constants in `protocols/sp.rs` (and for UpSPA pwdupd v2, computed in the bench).
+
+---
+
+## Primitive op names
+
+These are the `op` names you will see in the output for `kind=prim` and `kind=sp`.
+
+### Client primitives (`kind=prim`)
+
+**UpSPA (`scheme=upspa`):**
+- `TOPRF_recv_eval_tsp`
+- `AEAD_DEC_cipherid`
+- `AEAD_DEC_ciphersp`
+- `AEAD_ENC_ciphersp_with_rng`
+- `AEAD_ENC_ciphersp_fixed_nonce`
+- `HASH_suid`
+- `HASH_vinfo`
+
+**TSPA (`scheme=tspa`):**
+- `HASH_storuid`
+- `HASH_vinfo`
+- `OPRF_finalize`
+- `OPRF_eval_full` (MulP + finalize)
+- `OPRF_recv_eval_tsp`
+- `MulP_point_scalar`
+- `InvS_scalar_invert`
+- `FieldOp_mul_add`
+- `AES256CTR_xor_32`
+- `PolyEval_degree_t_minus_1`
+
+### Server/storage-provider primitives (`kind=sp`)
+
+**UpSPA (`scheme=upspa`):**
+- `srv_TOPRF_send_eval_one`
+- `srv_DB_get_ciphersp_one`
+- `srv_DB_put_ciphersp_one`
+- `srv_Ed25519_verify_pwdupd_v1_one`
+- `srv_PWDUPD_v1_apply_one`
+- `srv_Ed25519_verify_pwdupd_v2_one`
+- `srv_PWDUPD_v2_verify_only_one`
+
+**TSPA (`scheme=tspa`):**
+- `srv_OPRF_send_eval_one`
+- `srv_DB_get_record_one`
+- `srv_DB_put_record_one`
+
+---
+
+## Measurement methodology
+
+For each `(nsp, tsp)` point and each operation:
+
+1) **Warmup**: run the operation `--warmup-iters` times (default 300).
+2) **Sampling**: run the operation `--sample-size` times (default 2000), recording elapsed nanoseconds.
+3) Compute summary stats:
+   - min, p50 (median), p95, max, mean, stddev
+
+Timing uses `std::time::Instant` and `black_box()` to limit compiler elimination.
+
+Deterministic seeding:
+- a BLAKE3 hash of (tag, nsp, tsp) seeds ChaCha20Rng.
+- repeated runs on the same machine produce identical fixtures and RNG streams (modulo OS scheduling noise).
+
+`--rng-in-timed`:
+- affects only some client benches where RNG can be hoisted out (e.g., fixed nonce AEAD).
+- the flag is still recorded in the output row for filtering/plotting consistency.
+
+---
+
+## Building
+
+Use release mode for meaningful crypto timings:
+
+```bash
+cargo build --release
+```
+
+---
+
+## CLI flags (complete)
+
+Run `cargo run --release --bin bench_unified -- --help` for the built-in help text.
+These flags are supported:
+
+### Core
+- `--scheme all|upspa|tspa` (default: `all`)
+- `--kind proto,prim,sp,net,full` (comma-separated; default: `proto,prim`)
+  - `--kind all` runs everything.
+- `--pwdupd 1|2|both|v1|v2` (default: `1`)
+  - alias: `--pwdupd-v2` sets v2
+- `--out FILE` (default: `unified_bench.dat`)
+- `--help` / `-h`
+
+### Grid
+- `--nsp 20,40,60,80,100` (default shown)
+- `--tsp 5,10,20` absolute thresholds (overrides `--tsp-pct`)
+- `--tsp-pct 20,40,60,80,100` percentage of nsp (rounded up; clamped to `[1,nsp]`)
+
+### Timing
+- `--sample-size N` (default: 2000)
+- `--warmup-iters N` (default: 300)
+- `--rng-in-timed` (alias `--rng`)
+
+### Network (used by `--kind net` and/or `--kind full`)
+- `--net lan|wan|all` (default: `all`)
+- `--lan-rtt-ms X`
+- `--lan-jitter-ms Y`
+- `--lan-bw-mbps Z`
+- `--wan-rtt-ms X`
+- `--wan-jitter-ms Y`
+- `--wan-bw-mbps Z`
+- `--overhead-bytes N` (default: 64)
+
+### Server p50 calibration (only used by `--kind full`)
+- `--proc-warmup N` (default: 200)
+- `--proc-samples N` (default: 1000)
+
+### Compatibility
+- `--bench` is tolerated/ignored (to survive Cargo/libtest noise).
+
+---
+
+## Common runs
+
+### 1) Client-only protocol phases (UpSPA + TSPA)
+```bash
+cargo run --release --bin bench_unified -- \
+  --scheme all \
+  --kind proto \
+  --out proto_only.dat
+```
+
+### 2) Client primitives only
+```bash
+cargo run --release --bin bench_unified -- \
+  --scheme all \
+  --kind prim \
+  --out prim_only.dat
+```
+
+### 3) Server primitives only
+```bash
+cargo run --release --bin bench_unified -- \
+  --scheme all \
+  --kind sp \
+  --pwdupd both \
+  --out sp_only.dat
+```
+
+### 4) Net-only simulation (LAN + WAN)
+```bash
+cargo run --release --bin bench_unified -- \
+  --scheme all \
+  --kind net \
+  --net all \
+  --out net_only.dat
+```
+
+### 5) End-to-end modeled totals (WAN only)
+```bash
+cargo run --release --bin bench_unified -- \
+  --scheme all \
+  --kind full \
+  --net wan \
+  --out full_wan.dat
+```
+
+### 6) Compare pwdupd v1 vs v2 everywhere (UpSPA)
+```bash
+cargo run --release --bin bench_unified -- \
+  --scheme upspa \
+  --kind proto,sp,net,full \
+  --pwdupd both \
+  --net all \
+  --out upspa_pwdupd_both.dat
+```
+
+---

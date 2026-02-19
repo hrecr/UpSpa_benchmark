@@ -23,6 +23,16 @@ The benchmark suite is **manual and reproducible**:
 UpSpa_benchmark/
 ├── Cargo.toml
 ├── README.md
+├── docs/
+│   ├── tspa/
+│   │   ├── auth.md
+│   │   └── reg.md
+│   └── upspa/
+│       ├── setup.md
+│       ├── reg.md
+│       ├── auth.md
+│       ├── secupd.md
+│       └── pwdupd.md
 └── src/
     ├── lib.rs
     ├── crypto.rs

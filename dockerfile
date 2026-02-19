@@ -12,7 +12,7 @@ RUN rm -rf src
 # Copy actual sources
 COPY src ./src
 
-# Build release binaries (includes bench_all)
+# Build release binaries (includes bench_unified)
 RUN cargo build --release --bins
 
 FROM debian:bookworm-slim
@@ -21,10 +21,10 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy the single benchmark binary
-COPY --from=builder /app/target/release/bench_all /usr/local/bin/bench_all
+# Copy the unified benchmark binary
+COPY --from=builder /app/target/release/bench_unified /usr/local/bin/bench_unified
 
 WORKDIR /out
 
-# Run bench_all directly; pass flags after the image name
-ENTRYPOINT ["/usr/local/bin/bench_all"]
+# Run bench_unified directly; pass flags after the image name
+ENTRYPOINT ["/usr/local/bin/bench_unified"]

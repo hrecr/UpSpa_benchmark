@@ -339,3 +339,154 @@ cargo run --release --bin bench_unified -- \
 ```
 
 ---
+## Running Benchmarks with Docker
+
+###  Build the Docker Image
+
+From the root of the repository:
+
+```bash
+docker build -t upspa-bench .
+```
+
+This builds the image and compiles `bench_unified` in release mode inside the container.
+
+---
+
+## Basic Usage Pattern
+
+All benchmark flags are passed **after the image name**:
+
+```bash
+docker run --rm -v $(pwd)/out:/out upspa-bench [FLAGS...]
+```
+
+* `--rm` → removes container after exit
+* `-v $(pwd)/out:/out` → mounts a local `out/` directory for results
+* `/out` is the working directory inside the container
+* Output files will appear in `./out`
+
+---
+
+# Example Runs
+
+---
+
+## Client-only protocol phases
+
+```bash
+docker run --rm -v $(pwd)/out:/out upspa-bench \
+  --scheme all \
+  --kind proto \
+  --out proto.dat
+```
+
+---
+
+## Client primitives only
+
+```bash
+docker run --rm -v $(pwd)/out:/out upspa-bench \
+  --scheme all \
+  --kind prim \
+  --out prim.dat
+```
+
+---
+
+## Server-side primitives only
+
+```bash
+docker run --rm -v $(pwd)/out:/out upspa-bench \
+  --scheme all \
+  --kind sp \
+  --pwdupd both \
+  --out sp.dat
+```
+
+---
+
+## Network-only simulation (LAN + WAN)
+
+```bash
+docker run --rm -v $(pwd)/out:/out upspa-bench \
+  --scheme all \
+  --kind net \
+  --net all \
+  --out net.dat
+```
+
+---
+
+## End-to-End modeled (client + net + server), WAN only
+
+```bash
+docker run --rm -v $(pwd)/out:/out upspa-bench \
+  --scheme all \
+  --kind full \
+  --net wan \
+  --out full_wan.dat
+```
+
+---
+
+## Compare pwdupd v1 vs v2 (UpSPA only)
+
+```bash
+docker run --rm -v $(pwd)/out:/out upspa-bench \
+  --scheme upspa \
+  --kind proto,sp,net,full \
+  --pwdupd both \
+  --net all \
+  --out upspa_pwdupd_compare.dat
+```
+
+---
+
+## Custom Grid Example
+
+```bash
+docker run --rm -v $(pwd)/out:/out upspa-bench \
+  --scheme all \
+  --kind full \
+  --nsp 20,40 \
+  --tsp-pct 20,50 \
+  --sample-size 500 \
+  --warmup-iters 100 \
+  --net lan \
+  --out custom_run.dat
+```
+
+---
+
+# Output Location
+
+All results will appear in:
+
+```
+./out/
+```
+
+Example:
+
+```
+./out/full_wan.dat
+./out/sp.dat
+./out/proto.dat
+```
+
+---
+
+# Override Network Parameters (Example)
+
+```bash
+docker run --rm -v $(pwd)/out:/out upspa-bench \
+  --kind full \
+  --net wan \
+  --wan-rtt-ms 100 \
+  --wan-bw-mbps 20 \
+  --wan-jitter-ms 10 \
+  --out slow_wan.dat
+```
+
+

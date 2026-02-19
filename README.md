@@ -31,8 +31,8 @@ UpSpa_benchmark/
 │       ├── setup.md
 │       ├── reg.md
 │       ├── auth.md
-│       ├── secupd.md
-│       └── pwdupd.md
+│       ├── secret_update.md
+│       └── pwd_update.md
 └── src/
     ├── lib.rs
     ├── crypto.rs
@@ -498,5 +498,6 @@ docker run --rm -v $(pwd)/out:/out upspa-bench \
   --wan-jitter-ms 10 \
   --out slow_wan.dat
 ```
+
 
 

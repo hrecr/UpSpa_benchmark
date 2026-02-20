@@ -1,4 +1,4 @@
-# UpSPA vs TSPA Benchmarks (Rust)
+# UpSPA vs TSPA Benchmarks 
 
 This repository contains a small Rust crate (`(Up/T)SPA`) plus a **single, unified benchmark binary** that can measure:
 
@@ -111,9 +111,9 @@ Output ops look like:
 
 Measures a modeled end-to-end time per phase:
 
-\$
-T_{full} = T_{client,measured} + T_{net,simulated}(\text{LAN/WAN}, \text{bytes}, \text{jitter}, \text{bw}, \text{overhead}, proc_{p50})
-\$
+
+T_full = T_{client,measured} + T_{net,simulated,serverside}(LAN/WAN,bytes,jitter,bw,overhead,proc_{p50})
+
 
 Where:
 - `T_client,measured` is real local timing of the client phase implementation.
@@ -478,6 +478,7 @@ docker run --rm -v $(pwd)/out:/out upspa-bench \
   --wan-jitter-ms 10 \
   --out slow_wan.dat
 ```
+
 
 
 

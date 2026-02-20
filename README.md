@@ -160,8 +160,8 @@ Default profiles (can be overridden by flags):
 **UpSPA:**
 - `setup`: `nsp` parallel messages
 - `reg`: TOPRF to `tsp` + PUT to `nsp`
-- `auth`: TOPRF to `tsp` + GET to `m = ceil(nsp / tsp)`
-- `secupd`: TOPRF to `tsp` + GET to `m` + PUT to `nsp`
+- `auth`: TOPRF to `tsp` + GET to `two sp`
+- `secupd`: TOPRF to `tsp` + GET to `two sp` + PUT to `nsp`
 - `pwdupd`: TOPRF to `tsp` + password-update to `nsp`
   - v2 uses a smaller request payload size than v1 (see `upspa_pwdupd_req_bytes()` in the bench)
 
@@ -466,26 +466,6 @@ docker run --rm -v $(pwd)/out:/out upspa-bench \
   --net lan \
   --out custom_run.dat
 ```
-
----
-
-# Output Location
-
-All results will appear in:
-
-```
-./out/
-```
-
-Example:
-
-```
-./out/full_wan.dat
-./out/sp.dat
-./out/proto.dat
-```
-
----
 
 # Override Network Parameters (Example)
 

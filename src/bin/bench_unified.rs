@@ -489,7 +489,6 @@ fn measure_server_procs_p50(nsp: usize, tsp: usize, warmup: usize, samples: usiz
 
     let sig_v2: Signature = sid.sign(&msg_v2);
 
-    // Use the same provider's verifying key (sig_pk_bytes) via up_prov2.sig_pk.
     for _ in 0..warmup {
         black_box(up_prov2.sig_pk.verify(&msg_v2, &sig_v2).is_ok());
     }
@@ -645,7 +644,7 @@ fn upspa_recover_state_and_cipherid_pt(
     let b = &fx.pwd_point * it.r;
     black_box(b);
 
-    // TOPRF receiver-side eval using server partials (already in it.partials)
+    // TOPRF receiver-side eval using server partials
     let state_key = up_crypto::toprf_client_eval_from_partials(
         &fx.password,
         it.r,
@@ -963,7 +962,7 @@ fn upspa_pwdupd_v2_no_rng(
 
 //
 // ====================
-// UPSPA AUTH (2 decryptions variant)
+// UPSPA AUTH 
 //   - 1 decrypt cipherid (inside upspa_recover_state_and_cipherid_pt)
 //   - 1 decrypt ciphersp (only one provider)
 // ====================
@@ -972,20 +971,20 @@ fn upspa_auth_two_decryptions(
     fx: &upspa_proto::Fixture,
     it: &upspa_proto::IterData,
 ) -> [u8; 32] {
-    // decrypt #1: cipherid (also does TOPRF eval)
+    // decrypt #1: cipherid 
     let (_state_key, cipherid_pt) = upspa_recover_state_and_cipherid_pt(fx, it);
     let (rsp, fk, _sid) = upspa_extract_rsp_fk_sid(&cipherid_pt);
 
     let mut acc = blake3::Hasher::new();
     acc.update(b"uptspa/authentication/acc/2dec_v1");
 
-    // SUid hashes for contacted providers (ids_for_t)
+    // SUid hashes for contacted providers 
     for &id in fx.ids_for_t.iter() {
         let suid = up_crypto::hash_suid(&rsp, &fx.lsj, id);
         acc.update(suid.as_ref());
     }
 
-    // decrypt #2: exactly ONE ciphersp (pick first contacted provider)
+    // decrypt #2: exactly ONE ciphersp 
     let id0 = fx.ids_for_t[0];
     let blob = &fx.ciphersp_per_sp[(id0 - 1) as usize];
     let pt = up_crypto::xchacha_decrypt_detached(&fk, &fx.ciphersp_aad, blob)
@@ -1026,7 +1025,6 @@ fn bench_upspa_client_proto(
     // Setup bench fixture is separate.
     let fx_setup = upspa_proto::make_setup_bench_fixture();
 
-    // --- setup (always uses RNG) ---
     {
         let mut rng = ChaCha20Rng::from_seed(seed_for(b"bench_unified/upspa/proto/setup_rng", nsp, tsp));
         let st = bench_u128(
@@ -1048,7 +1046,7 @@ fn bench_upspa_client_proto(
     let mut rng_sec = ChaCha20Rng::from_seed(seed_for(b"bench_unified/upspa/proto/sec_it", nsp, tsp));
     let mut rng_pwd = ChaCha20Rng::from_seed(seed_for(b"bench_unified/upspa/proto/pwd_it", nsp, tsp));
 
-    // --- reg ---
+    // REGESTRATION (with or without RNG inside protocol)
     {
         let st = bench_u128(
             || {
@@ -1092,7 +1090,7 @@ fn bench_upspa_client_proto(
         write_row(out, scheme, "proto", "auth", rng_in_timed, nsp, tsp, warmup, &st)?;
     }
 
-    // --- secret update ---
+    // SECRET UPDATE (with or without RNG inside protocol)
     {
         let st = bench_u128(
             || {
@@ -1118,7 +1116,7 @@ fn bench_upspa_client_proto(
         write_row(out, scheme, "proto", "secupd", rng_in_timed, nsp, tsp, warmup, &st)?;
     }
 
-    // --- password update (v1/v2) ---
+    // PASSWORD UPDATE (with or without RNG inside protocol, and v1 vs v2 message formats)
     for &v in pwdupd_versions {
         let op_label = if v == 2 { "pwdupd_v2" } else { "pwdupd" };
         let st = bench_u128(
@@ -1319,21 +1317,21 @@ fn bench_tspa_client_proto(
     let mut rng_reg = ChaCha20Rng::from_seed(seed_for(b"bench_unified/tspa/proto/reg_it", nsp, tsp));
     let mut rng_auth = ChaCha20Rng::from_seed(seed_for(b"bench_unified/tspa/proto/auth_it", nsp, tsp));
 
-    // setup (client-side placeholder; actual server init is accounted in server benches / full model)
-    {
-        let st = bench_u128(
-            || {
-                let t0 = Instant::now();
-                black_box((&fx.uid, &fx.lsj, &fx.password));
-                black_box(fx.pwd_point);
-                black_box(&fx.lambdas_sel);
-                t0.elapsed().as_nanos()
-            },
-            warmup,
-            samples,
-        );
-        write_row(out, scheme, "proto", "setup", rng_in_timed, nsp, tsp, warmup, &st)?;
-    }
+    // // setup (client-side placeholder; actual server init is accounted in server benches / full model)
+    // {
+    //     let st = bench_u128(
+    //         || {
+    //             let t0 = Instant::now();
+    //             black_box((&fx.uid, &fx.lsj, &fx.password));
+    //             black_box(fx.pwd_point);
+    //             black_box(&fx.lambdas_sel);
+    //             t0.elapsed().as_nanos()
+    //         },
+    //         warmup,
+    //         samples,
+    //     );
+    //     write_row(out, scheme, "proto", "setup", rng_in_timed, nsp, tsp, warmup, &st)?;
+    // }
 
     // reg
     {
@@ -2053,8 +2051,6 @@ fn net_upspa_pwdupd(nsp: usize, tsp: usize, prof: NetProfile, version: u8, proc_
 }
 
 fn net_tspa_setup(prof: NetProfile, proc_ns: u64, rng: &mut impl RngCore) -> u64 {
-    // No client<->provider messages modeled here, just "server init" as time.
-    // For net-only, pass proc_ns = 0.
     black_box((prof.name, rng.next_u64()));
     proc_ns
 }
